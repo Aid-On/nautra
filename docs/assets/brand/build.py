@@ -142,11 +142,13 @@ def backdrop(size, dark):
     return im
 
 
-def card(symbol, size, dark, tagline=None):
+def card(symbol, size, dark, tagline=None, fill=0.8):
+    """`fill` is the share of the card's width the logo occupies."""
     scale = 2
     w, h = size[0] * scale, size[1] * scale
     im = backdrop((w, h), dark).convert("RGBA")
-    logo = lockup(symbol, dark, round(h * 0.42))
+    probe = lockup(symbol, dark, 400)
+    logo = lockup(symbol, dark, round(400 * w * fill / probe.width))
     y = (h - logo.height) // 2 - (round(h * 0.05) if tagline else 0)
     im.alpha_composite(logo, ((w - logo.width) // 2, y))
     if tagline:
@@ -169,7 +171,7 @@ def main():
         card(symbol, (1440, 606), dark).save(HERE / f"nautra-cover{suffix}.png", optimize=True)
         if not dark:
             card(symbol, (1280, 640), False,
-                 "Build, ship and run WebAssembly workloads").save(
+                 "Build, ship and run WebAssembly workloads", fill=0.78).save(
                 HERE / "nautra-ogp.png", optimize=True)
 
 
