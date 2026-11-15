@@ -19,13 +19,13 @@ that work is done in.
 | `src/image.almd` | Nautrafile, building an image, what an image asks for |
 | `src/registry.almd` | OCI Distribution: pull, push, authentication |
 | `src/compose.almd` | `nautra.toml`: a workload and its tools, read into `run` options |
-| `src/native.almd` | a native tool or check: nautra's grants turned into Porta's options |
+| `src/native.almd` | a native tool or check: nautra's grants turned into one request to Porta's sandbox (`porta_sandbox`, a dependency), and the hidden `__native` entry that applies it |
 | `src/runs.almd` | background runs: the record, the log, stop and remove |
 | `src/engine.almd` | every `@extern` into the native side |
 | `native/engine.rs` | one run applied to wasmtime; the guest's view of the host, built from the request |
 | `native/engine/outbound.rs` | outbound `wasi:http`: destinations, secrets, the audit record |
 | `native/engine/journal.rs` | `--record`: the exchanges of a run, replayed or resumed |
-| `native/engine/native.rs` | starts Porta for a native tool or check and collects its output |
+| `native/engine/native.rs` | starts nautra once more for a native tool or check and collects its output |
 | `native/engine/tools.rs` | the MCP endpoint at `tools.nautra`; a tool call is a captured run |
 | `native/engine/serve.rs` | an HTTP component served on a published address (`-p`) |
 | `native/engine/spawn.rs` | `run -d`: nautra started once more with no terminal |
@@ -63,9 +63,10 @@ NAUTRA_TEST_REGISTRY=localhost:5057 python3 scripts/integration.py target/nautra
   pushed, run.
 - Text that came from an image or a registry is stripped of control
   characters before it is printed.
-- Nautra confines Wasm only. A native command goes to Porta, and an entry
-  Porta cannot hold to its words is refused, never run more openly. Nothing
-  Wasm may come to need Porta.
+- Nautra's own code confines Wasm only. A native command is confined by
+  Porta's sandbox, which is a dependency and is changed in Porta, never
+  copied here; an entry the sandbox cannot hold to its words is refused,
+  never run more openly. Nothing Wasm may come to need it.
 - A name without a registry is never sent anywhere.
 - An exchange a record shows as begun and not ended is never repeated.
 - A secret's real value exists only in the host process: the guest holds a

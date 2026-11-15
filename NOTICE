@@ -9,4 +9,8 @@ the Apache License, Version 2.0 (see LICENSE).
 The contents of the `ee/` directory are NOT licensed under the Apache License.
 They are licensed under the Nautra Enterprise License (see ee/LICENSE).
 
+A nautra binary is built with the native sandbox of Porta
+(https://github.com/almide/porta, the `sandbox/` package), which is licensed
+under the Apache License, Version 2.0. Its source is not in this repository.
+
 "Nautra" and the Nautra logo are trademarks of Aid-On (see TRADEMARKS.md).

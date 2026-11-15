@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //! A tool or a check that is a native command rather than a Wasm image.
 //!
-//! Nautra confines Wasm; it does not confine native processes. A native
-//! command is handed to Porta, nautra's sister, which confines it with the
-//! host kernel. The whole Porta command line is decided in Almide
-//! (`src/native.almd`) before the run starts; this only starts it, gives it
-//! the call's arguments on stdin, and collects what it wrote.
+//! Nautra confines Wasm; a native command is confined by the host kernel,
+//! through Porta's sandbox, which is built in. The command does not run in
+//! this process: nautra is started once more with the entry, decided in
+//! Almide (`src/native.almd`) before the run starts, and that copy applies
+//! the sandbox and waits. This only starts the copy, gives it the call's
+//! arguments on stdin, and collects what the command wrote.
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
@@ -22,11 +23,14 @@ pub(super) fn is_native(request: &Value) -> bool {
 
 pub(super) fn run_native(request: &Value, stdin: Vec<u8>) -> Captured {
     let refused = |error: String| Captured { exit_code: 125, error, stdout: String::new(), stderr: String::new() };
-    let Some(program) = request["native"]["program"].as_str() else { return refused("a native request names no program".into()) };
+    let program = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => return refused(format!("cannot find nautra's own binary to run a native command: {error}")),
+    };
     let args: Vec<&str> = request["native"]["args"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-    let mut child = match Command::new(program).args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+    let mut child = match Command::new(&program).args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
         Ok(child) => child,
-        Err(error) => return refused(format!("cannot start {program}: {error}")),
+        Err(error) => return refused(format!("cannot start {}: {error}", program.display())),
     };
     // Written from a thread of its own: a command that fills its output
     // before reading its input would otherwise stop both sides.
@@ -44,7 +48,7 @@ pub(super) fn run_native(request: &Value, stdin: Vec<u8>) -> Captured {
     }
     let exit_code = match child.wait() {
         Ok(status) => status.code().map(i64::from).unwrap_or(137),
-        Err(error) => return refused(format!("lost track of {program}: {error}")),
+        Err(error) => return refused(format!("lost track of the native command: {error}")),
     };
     Captured { exit_code, error: String::new(), stdout, stderr }
 }

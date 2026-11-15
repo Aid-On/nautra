@@ -1,0 +1,3 @@
+# almide.lock — auto-generated, do not edit
+
+porta_sandbox = { git = "https://github.com/almide/porta", ref = "sandbox-package", commit = "0ebee8ee7c4d20db825e0718c2ae3bd4f9aedfec", subdir = "sandbox" }

@@ -272,8 +272,9 @@ secrets = ["MCP_TOKEN@mcp.example.com"]
 
 Nautra confines Wasm. When an agent needs a native program — git, a compiler,
 a test runner — a tool or a check names it with `command` in place of
-`image`, and nautra hands it to its sister, [Porta](https://github.com/almide/porta),
-which confines native processes with the host kernel.
+`image`, and nautra confines it with the host kernel, through the sandbox of
+its sister, [Porta](https://github.com/almide/porta), which is built into
+nautra. Nothing else has to be installed.
 
 ```toml
 [tools.git_log]
@@ -288,7 +289,7 @@ mounts = ["./repo"]
 reads = "open"                           # a toolchain reads outside its mounts
 ```
 
-The grants are nautra's words, turned into Porta's options, with nautra's
+The grants are nautra's words, turned into one sandbox request, with nautra's
 stance kept: no network unless named, and reads confined to the mounts and
 the system directories unless `reads = "open"`. Three things differ from a
 Wasm entry, because a native process is a different thing to confine:
@@ -296,14 +297,17 @@ Wasm entry, because a native process is a different thing to confine:
 - a mount is a host directory seen where it is (`DIR` or `DIR:ro`), with no
   guest path; the command starts in its first mount;
 - network is granted by host name (over HTTPS) or by port (`*:8080`), not by
-  address — an entry Porta could not hold to its words is refused, not run
-  more openly;
-- `memory` and `fuel` do not apply; `porta = ["--max-procs", "200"]` passes
-  Porta's own options through.
+  address and not by both — an entry the sandbox could not hold to its words
+  is refused, not run more openly;
+- `memory` and `fuel` do not apply; `porta = ["--max-procs", "200"]` sets
+  what only the sandbox has a word for: `--max-cpu`, `--max-procs`,
+  `--max-file-size`, `--max-memory-mb`, `--allow-bind`, `--allow-unix`,
+  `--deny-unix`, `--deny-read`, `--protect`, `--preset`, `--allow-root`.
 
-Porta has to be installed for these entries; everything else in nautra works
-without it. The arguments still arrive as JSON on stdin and the result is
-stdout.
+The arguments still arrive as JSON on stdin and the result is stdout. The
+command runs under a second copy of nautra, which applies the sandbox and
+waits for it; on Linux the sandbox is Landlock, seccomp and namespaces, on
+macOS `sandbox-exec`.
 
 ### Record, replay, resume
 

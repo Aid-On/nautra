@@ -1,114 +1,248 @@
 // SPDX-License-Identifier: Apache-2.0
-// Native commands, handed to Porta.
+// Native commands, confined by Porta's sandbox.
 //
 // Nautra confines Wasm. A tool or a check that is a native program — git, a
-// compiler, a test runner — is confined by Porta, nautra's sister, with the
-// host kernel. An entry's grants are written in nautra's words and turned
-// into Porta's options here, keeping nautra's stance: what the entry does
-// not name stays closed.
+// compiler, a test runner — is confined by the host kernel, through the
+// sandbox of Porta, nautra's sister, which is built into nautra as a package
+// (`porta_sandbox`). An entry's grants are written in nautra's words and
+// turned into one sandbox request here, keeping nautra's stance: what the
+// entry does not name stays closed.
 //
-// Where Porta cannot hold a native process to what nautra's words would
+// Where the sandbox cannot hold a native process to what nautra's words would
 // promise, the entry is refused rather than run more openly.
+//
+// The command does not run inside nautra's own process: nautra starts itself
+// once more (`nautra __native ENTRY`), and that copy applies the request and
+// waits for the command, so the command's output is the copy's and can be
+// collected like any tool's.
 
 import env
-import fs
+import json
 import path
+import porta_sandbox
 import self.grants
+
+// One entry as the composition file wrote it. `timeout` is "" when the entry
+// names none; `extra` is the `porta = […]` list, in Porta's own words.
+type Entry = {
+  command: List[String],
+  base: String,
+  mounts: List[String],
+  net: List[String],
+  env: List[String],
+  secrets: List[String],
+  timeout: String,
+  reads: String,
+  extra: List[String],
+}
+
+// What an entry comes to: the request the sandbox applies, the proxy that is
+// the run's only way out when it is held to host names, and the host
+// variables to copy in when the command starts.
+type Plan = {
+  request: porta_sandbox.Request,
+  proxy: porta_sandbox.ProxyConfig,
+  passed: List[String],
+}
 
 local fn is_address(host: String) -> Bool =
   string.contains(host, ":") or (string.to_list(host) |> list.all((c) => string.is_digit(c) or c == "."))
 
-// A mount for a native command is a host directory seen where it is: Porta
-// does not move a directory to another path the way a Wasm guest sees one.
-local fn mount(base: String, text: String) -> List[String]! = {
+// A mount for a native command is a host directory seen where it is: the
+// sandbox does not move a directory to another path the way a Wasm guest
+// sees one.
+local fn mount(base: String, text: String) -> String! = {
   let (host, readonly) = match string.strip_suffix(text, ":ro") {
     some(h) => (h, true),
     none => (string.strip_suffix(text, ":rw") ?? text, false),
   }
   guard host != "" and not string.contains(host, ":") else err("'${text}': a native command sees host directories where they are; write DIR or DIR:ro, with no guest path")
   let absolute = if path.is_absolute(host) then host else path.join(base, host)
-  ["-v", if readonly then "${absolute}:ro" else absolute]
+  if readonly then "${absolute}:ro" else absolute
 }
 
-// One network grant as Porta can enforce it. Returns a host for Porta's
-// proxy (the only way it holds a process to a name), or a port rule.
+// One network grant as the sandbox can enforce it. Returns a host for the
+// proxy (the only way a process is held to a name), or a port rule.
 local fn net_rule(text: String) -> (String, String)! = {
   let rule = grants.parse_net(text)!
   if rule.host == "*" then ("", "*:${rule.port}")
   else {
-    guard not is_address(rule.host) else err("'${text}': Porta holds a native command to host names (over HTTPS) or to ports, not to an address; write a name, or *:PORT")
-    guard rule.port == 0 or rule.port == 443 else err("'${text}': Porta holds a native command to a host name over HTTPS only; write ${rule.host}, or *:${rule.port} for the port alone")
+    guard not is_address(rule.host) else err("'${text}': a native command is held to host names (over HTTPS) or to ports, not to an address; write a name, or *:PORT")
+    guard rule.port == 0 or rule.port == 443 else err("'${text}': a native command is held to a host name over HTTPS only; write ${rule.host}, or *:${rule.port} for the port alone")
     (rule.host, "")
   }
 }
 
-// The arguments Porta is run with for one entry: `run COMMAND [options] -- ARGS`.
-// `timeout` is in the entry's own words (`30s`); `extra` are options passed
-// to Porta as they are, for what only Porta has a word for.
-fn porta_args(command: List[String], base: String, mounts: List[String], net: List[String], env_grants: List[String], secrets: List[String], timeout: String?, reads: String, extra: List[String]) -> List[String]! = {
-  let program = list.first(command) |> option.to_result("command is empty")!
-  guard reads == "strict" or reads == "open" else err("reads is 'strict' or 'open', not '${reads}'")
-  let mount_options = mounts |> list.map((m) => mount(base, m)!)! |> list.flatten
-  let open = list.contains(net, "*")
-  let rules = net |> list.filter((n) => n != "*") |> list.map((n) => net_rule(n)!)!
-  let bound = secrets |> list.map((s) => grants.parse_secret(s)!)!
+local fn whole(text: String, word: String) -> Int! = {
+  let n = int.parse(text) |> result.map_err((_) => "porta ${word} takes a whole number, not '${text}'")!
+  guard n >= 0 else err("porta ${word} takes a whole number, not '${text}'")
+  n
+}
+
+// The `porta = […]` words, for what only the sandbox has a word for. They
+// close further or set a ceiling; a word that would open what the entry's
+// own keys decide (mounts, the network, variables) is not taken here.
+local fn with_extra(request: porta_sandbox.Request, words: List[String]) -> porta_sandbox.Request! = match words {
+  [] => request,
+  [word, ..rest] => {
+    let text = list.first(rest) ?? ""
+    let after = list.drop(rest, 1)
+    guard word == "--allow-root" or not list.is_empty(rest) else err("porta ${word} needs a value")
+    match word {
+      "--allow-root" => with_extra({ ...request, allow_root: true }, rest)!,
+      "--max-cpu" => with_extra({ ...request, max_cpu: whole(text, word)! }, after)!,
+      "--max-procs" => with_extra({ ...request, max_procs: whole(text, word)! }, after)!,
+      "--max-file-size" => with_extra({ ...request, max_file_size: whole(text, word)! }, after)!,
+      "--max-memory-mb" => with_extra({ ...request, max_memory_mb: whole(text, word)! }, after)!,
+      "--allow-bind" => with_extra({ ...request, bind: request.bind + [text] }, after)!,
+      "--allow-unix" => with_extra({ ...request, unix: request.unix + [text] }, after)!,
+      "--deny-unix" => with_extra({ ...request, deny_unix: request.deny_unix + [text] }, after)!,
+      "--deny-read" => with_extra({ ...request, deny_read: request.deny_read + [text] }, after)!,
+      "--protect" => with_extra({ ...request, protect: request.protect + [text] }, after)!,
+      "--preset" => with_extra({ ...request, preset: text }, after)!,
+      other => err("porta = [… '${other}' …] is not a word nautra passes to the sandbox; it takes --max-cpu, --max-procs, --max-file-size, --max-memory-mb, --allow-bind, --allow-unix, --deny-unix, --deny-read, --protect, --preset and --allow-root")!,
+    }
+  },
+}
+
+// What an entry comes to. Nothing here touches the host: an entry is judged
+// when the composition file is read, and again by the copy that runs it.
+fn plan(e: Entry) -> Plan! = {
+  let program = list.first(e.command) |> option.to_result("command is empty")!
+  guard e.reads == "strict" or e.reads == "open" else err("reads is 'strict' or 'open', not '${e.reads}'")
+  let dirs = e.mounts |> list.map((m) => mount(e.base, m)!)!
+  let open = list.contains(e.net, "*")
+  let rules = e.net |> list.filter((n) => n != "*") |> list.map((n) => net_rule(n)!)!
+  let bound = e.secrets |> list.map((s) => grants.parse_secret(s)!)!
   for secret in bound {
     for place in secret.hosts {
       guard place.port == 443 and not is_address(place.host) else err("secret ${secret.name}: for a native command a secret is bound to a host name over HTTPS, not to ${place.host}:${place.port}")
     }
   }
-  let credentials = bound |> list.flat_map((s) => ["--credential", "${s.name}=${s.hosts |> list.map((h) => h.host) |> list.join(",")}"])
-  // A credential turns Porta's proxy on, and a proxy with no allow list lets
-  // every host through: the hosts a secret is bound to are the allow list.
-  let hosts = (rules |> list.map(((host, _)) => host) |> list.filter((h) => h != "")) + (bound |> list.flat_map((s) => s.hosts |> list.map((h) => h.host)))
-  let ports = rules |> list.map(((_, port)) => port) |> list.filter((p) => p != "") |> list.flat_map((p) => ["--allow-net", p])
-  let network = if open then []
-    else if list.is_empty(hosts) and list.is_empty(ports) then ["--no-net"]
-    else (if list.is_empty(hosts) then [] else ["--proxy-allow", list.join(list.unique(hosts), ",")]) + ports
-  let variables = env_grants |> list.flat_map((e) => if string.contains(e, "=") then ["-e", e] else ["--env-pass", e])
-  let deadline = match timeout {
-    some(text) => ["--timeout", int.to_string((grants.parse_duration(text)! + 999) / 1000)],
-    none => [],
+  // A secret turns the proxy on, and a proxy with no allow list lets every
+  // host through: the hosts a secret is bound to are the allow list.
+  let hosts = list.unique((rules |> list.map(((host, _)) => host) |> list.filter((h) => h != "")) + (bound |> list.flat_map((s) => s.hosts |> list.map((h) => h.host))))
+  let ports = rules |> list.map(((_, port)) => port) |> list.filter((p) => p != "")
+  // The proxy is the only way out of a run held to host names, so a port
+  // rule beside one would be dropped without a word.
+  guard list.is_empty(hosts) or list.is_empty(ports) else err("net names both a host (${list.join(hosts, ", ")}) and a port alone (${list.join(ports, ", ")}); a native command is held to host names or to ports, not to both")
+  guard not open or list.is_empty(bound) else err("net = [\"*\"] beside a secret: a secret is put on by the proxy, which holds the command to the secret's hosts")
+  let credentials = bound |> list.map((s) => porta_sandbox.Credential { name: s.name, from_env: s.name, hosts: s.hosts |> list.map((h) => h.host) })
+  let set = e.env |> list.filter_map((text) => string.split_once(text, "=")) |> list.map(((key, val)) => porta_sandbox.EnvVar { key: key, val: val })
+  let seconds = if e.timeout == "" then 0 else (grants.parse_duration(e.timeout)! + 999) / 1000
+  let request = with_extra({
+    ...porta_sandbox.closed(program, list.drop(e.command, 1)),
+    dirs: dirs,
+    cwd: porta_sandbox.first_mount(dirs),
+    net: ports,
+    env: set,
+    read_policy: e.reads,
+    no_net: not open and list.is_empty(hosts) and list.is_empty(ports),
+    timeout: seconds,
+  }, e.extra)!
+  Plan {
+    request: request,
+    proxy: { ...porta_sandbox.no_proxy(), allow: hosts, credentials: credentials },
+    passed: e.env |> list.filter((text) => not string.contains(text, "=")),
   }
-  let rest = list.drop(command, 1)
-  ["run", program] + mount_options + network + credentials + variables + deadline + ["--read-policy", reads] + extra + (if list.is_empty(rest) then [] else ["--"] + rest)
 }
 
-// Where Porta is: NAUTRA_PORTA, or the first `porta` on PATH.
-effect fn porta() -> String = {
-  let named = env.get("NAUTRA_PORTA") ?? ""
-  let found = if named != "" then some(named) else
-    string.split(env.get("PATH") ?? "", ":") |> list.map((dir) => path.join(dir, "porta")) |> list.find((candidate) => fs.is_file(candidate))
-  found |> option.to_result("this is a native command, which nautra hands to Porta to confine, and porta is not installed (https://github.com/almide/porta); nautra itself confines only Wasm")!
+local fn strings(items: List[String]) -> Value = value.array(items |> list.map(value.string))
+
+// An entry as one argument, for the copy of nautra that runs it.
+fn encode(e: Entry) -> String = json.stringify(value.object([
+  ("command", strings(e.command)),
+  ("base", value.string(e.base)),
+  ("mounts", strings(e.mounts)),
+  ("net", strings(e.net)),
+  ("env", strings(e.env)),
+  ("secrets", strings(e.secrets)),
+  ("timeout", value.string(e.timeout)),
+  ("reads", value.string(e.reads)),
+  ("extra", strings(e.extra)),
+]))
+
+local fn listed(doc: Value, key: String) -> List[String] =
+  (value.get_array(doc, key) ?? []) |> list.filter_map((item) => result.to_option(value.as_string(item)))
+
+fn decode(text: String) -> Entry! = {
+  let doc = json.parse(text) |> result.map_err((_) => "not a native entry")!
+  Entry {
+    command: listed(doc, "command"),
+    base: value.get_string(doc, "base") ?? "",
+    mounts: listed(doc, "mounts"),
+    net: listed(doc, "net"),
+    env: listed(doc, "env"),
+    secrets: listed(doc, "secrets"),
+    timeout: value.get_string(doc, "timeout") ?? "",
+    reads: value.get_string(doc, "reads") ?? "strict",
+    extra: listed(doc, "extra"),
+  }
 }
+
+// The arguments nautra is started with to run an entry. The entry is judged
+// first, so one the sandbox cannot hold is refused when the file is read.
+fn arguments(e: Entry) -> List[String]! = {
+  let _ = plan(e)!
+  ["__native", encode(e)]
+}
+
+// `nautra __native ENTRY`: applies the entry's request and waits for the
+// command. Returns the command's exit code. A host variable the entry passes
+// by name and the host does not have adds nothing rather than an empty value.
+effect fn run(text: String) -> Int! = {
+  let planned = plan(decode(text)!)!
+  let passed = planned.passed |> list.filter_map((name) => env.get(name) |> option.map((val) => porta_sandbox.EnvVar { key: name, val: val }))
+  porta_sandbox.run({ ...planned.request, env: passed + planned.request.env }, planned.proxy, "")!
+}
+
+local fn entry(command: List[String], mounts: List[String], net: List[String], vars: List[String], secrets: List[String], timeout: String, reads: String, extra: List[String]) -> Entry =
+  Entry { command: command, base: "/p", mounts: mounts, net: net, env: vars, secrets: secrets, timeout: timeout, reads: reads, extra: extra }
 
 test "nothing is open unless the entry says so" {
-  assert_eq(porta_args(["git", "status"], "/p", [], [], [], [], none, "strict", []), ok(["run", "git", "--no-net", "--read-policy", "strict", "--", "status"]))
-  assert_eq(porta_args(["true"], "/p", [], [], [], [], none, "open", []), ok(["run", "true", "--no-net", "--read-policy", "open"]))
+  let p = plan(entry(["git", "status"], [], [], [], [], "", "strict", []))!
+  assert_eq(p.request.cmd, "git")
+  assert_eq(p.request.args, ["status"])
+  assert_eq(p.request.no_net, true)
+  assert_eq(p.request.dirs, [])
+  assert_eq(p.request.env, [])
+  assert_eq(p.request.read_policy, "strict")
+  assert_eq(porta_sandbox.proxy_enabled(p.proxy), false)
 }
 
-test "grants become Porta's options" {
-  let args = porta_args(["cargo", "test"], "/p", ["repo", "/abs/cache:ro"], ["crates.io", "*:8080"], ["CI=1", "HOME"], ["TOKEN@api.example.com"], some("90s"), "open", ["--max-procs", "200"])!
-  assert_eq(args, [
-    "run", "cargo",
-    "-v", "/p/repo", "-v", "/abs/cache:ro",
-    "--proxy-allow", "crates.io,api.example.com", "--allow-net", "*:8080",
-    "--credential", "TOKEN=api.example.com",
-    "-e", "CI=1", "--env-pass", "HOME",
-    "--timeout", "90",
-    "--read-policy", "open",
-    "--max-procs", "200",
-    "--", "test",
-  ])
-  assert_eq(list.contains(porta_args(["x"], "/p", [], ["*"], [], [], none, "strict", [])!, "--no-net"), false)
-  assert_eq(porta_args(["x"], "/p", [], [], [], [], some("500ms"), "strict", [])!, ["run", "x", "--no-net", "--timeout", "1", "--read-policy", "strict"])
+test "grants become one sandbox request" {
+  let p = plan(entry(["cargo", "test"], ["repo", "/abs/cache:ro"], ["crates.io"], ["CI=1", "HOME"], ["TOKEN@api.example.com"], "90s", "open", ["--max-procs", "200"]))!
+  assert_eq(p.request.dirs, ["/p/repo", "/abs/cache:ro"])
+  assert_eq(p.request.cwd, "/p/repo")
+  assert_eq(p.request.no_net, false)
+  assert_eq(p.proxy.allow, ["crates.io", "api.example.com"])
+  assert_eq(list.map(p.proxy.credentials, (c) => c.name), ["TOKEN"])
+  assert_eq(list.map(p.request.env, (v) => v.key), ["CI"])
+  assert_eq(p.passed, ["HOME"])
+  assert_eq(p.request.timeout, 90)
+  assert_eq(p.request.read_policy, "open")
+  assert_eq(p.request.max_procs, 200)
+  let ports = plan(entry(["x"], [], ["*:8080"], [], [], "500ms", "strict", []))!
+  assert_eq(ports.request.net, ["*:8080"])
+  assert_eq(ports.request.no_net, false)
+  assert_eq(ports.request.timeout, 1)
+  assert_eq(plan(entry(["x"], [], ["*"], [], [], "", "strict", []))!.request.no_net, false)
 }
 
-test "what Porta cannot hold a native command to is refused" {
-  assert(result.is_err(porta_args(["x"], "/p", ["a:/guest"], [], [], [], none, "strict", [])))
-  assert(result.is_err(porta_args(["x"], "/p", [], ["10.0.0.1:443"], [], [], none, "strict", [])))
-  assert(result.is_err(porta_args(["x"], "/p", [], ["example.com:8080"], [], [], none, "strict", [])))
-  assert(result.is_err(porta_args(["x"], "/p", [], [], [], ["K@127.0.0.1:8080"], none, "strict", [])))
-  assert(result.is_err(porta_args(["x"], "/p", [], [], [], [], none, "loose", [])))
-  assert(result.is_err(porta_args([], "/p", [], [], [], [], none, "strict", [])))
+test "what the sandbox cannot hold a native command to is refused" {
+  assert(result.is_err(plan(entry(["x"], ["a:/guest"], [], [], [], "", "strict", []))))
+  assert(result.is_err(plan(entry(["x"], [], ["10.0.0.1:443"], [], [], "", "strict", []))))
+  assert(result.is_err(plan(entry(["x"], [], ["example.com:8080"], [], [], "", "strict", []))))
+  assert(result.is_err(plan(entry(["x"], [], ["example.com", "*:8080"], [], [], "", "strict", []))))
+  assert(result.is_err(plan(entry(["x"], [], ["*"], [], ["K@example.com"], "", "strict", []))))
+  assert(result.is_err(plan(entry(["x"], [], [], [], ["K@127.0.0.1:8080"], "", "strict", []))))
+  assert(result.is_err(plan(entry(["x"], [], [], [], [], "", "loose", []))))
+  assert(result.is_err(plan(entry([], [], [], [], [], "", "strict", []))))
+  assert(result.is_err(plan(entry(["x"], [], [], [], [], "", "strict", ["-v", "/"]))))
+  assert(result.is_err(plan(entry(["x"], [], [], [], [], "", "strict", ["--max-procs"]))))
+}
+
+test "an entry survives the trip to the copy that runs it" {
+  let e = entry(["sh", "-c", "echo \"hi\""], ["repo:ro"], ["*:80"], ["A=b c"], [], "2m", "open", ["--preset", "none"])
+  assert_eq(decode(encode(e)), ok(e))
 }

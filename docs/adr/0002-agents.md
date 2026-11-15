@@ -141,7 +141,9 @@ workload sees it, so streaming is lost under `--record`.
 
 *Revised 2026-11-15. The first form of this section moved Porta's kernel
 sandbox here as `nautra exec`. Porta continues as a sister project, so two
-copies of that code would have to be kept equally strong; there is no `exec`.*
+copies of that code would have to be kept equally strong; there is no `exec`.
+Revised again the same day: Porta's sandbox became a package, and nautra
+builds it in.*
 
 Nautra confines Wasm, and that guarantee holds whatever the host is. A native
 process can only be confined by the host kernel, as strongly as this platform
@@ -149,22 +151,27 @@ allows — that is Porta's work, and it stays Porta's.
 
 Where an agent here needs a native program — git, a compiler, a test runner —
 a tool or a check entry names it with `command = […]` in place of `image`, and
-nautra hands it to Porta to confine. The entry's grants are written in
-nautra's words and turned into Porta's options (`src/native.almd`), keeping
-nautra's stance: no network unless named, reads confined to the mounts and
-the system directories unless `reads = "open"`. `porta = […]` passes Porta
-options through for what only Porta has a word for.
+nautra confines it with Porta's sandbox. The entry's grants are written in
+nautra's words and turned into one sandbox request (`src/native.almd`),
+keeping nautra's stance: no network unless named, reads confined to the
+mounts and the system directories unless `reads = "open"`. `porta = […]`
+names, in Porta's words, what only the sandbox has a word for — ceilings and
+further closures; a word that would open what the entry's own keys decide is
+not taken.
 
 Where Porta cannot hold a native process to what nautra's words would
 promise, the entry is refused rather than run more openly: a mount has no
 guest path (a native command sees a host directory where it is), and network
-is granted by host name over HTTPS or by port, never by address.
+is granted by host name over HTTPS or by port, never by address and never by
+both, since a run held to names leaves only through the proxy.
 
-**Independence.** Nautra must be usable alone: everything Wasm works with no
-Porta installed, and an entry that needs it says so. Today that entry runs
-the installed `porta`. The intended form is for Porta to publish its sandbox
-as a package nautra builds in, so that one nautra binary is enough; the
-entries in `nautra.toml` do not change when that happens.
+**Independence.** Nautra must be usable alone, and one nautra binary is
+enough. Porta publishes its sandbox as an Almide package (`porta_sandbox`, the
+`sandbox/` directory of its repository) and nautra builds it in as a
+dependency, so there is one copy of that code, kept in Porta. Nautra does not
+run the command in its own process: it starts itself once more
+(`nautra __native ENTRY`), and that copy judges the entry again, applies the
+request and waits, so the command's output is collected like any tool's.
 
 The other direction — a native agent running under Porta, using nautra's
 tools — is nautra publishing a composition's tools as an MCP server on
@@ -182,8 +189,8 @@ written for them is ported by making it speak MCP over HTTP.
 2. Tools as images, the composition file, and a sample agent in Almide. *(done)*
 3. `--record`, `replay`, resume. *(done, without clock and randomness)*
 4. Checks, delegation, remote MCP. *(done)*
-5. Native commands as tools and checks, through Porta. *(done, by running the
-   installed `porta`; building it in waits on Porta publishing a package)*
+5. Native commands as tools and checks, through Porta's sandbox, built in.
+   *(done)*
 6. Publishing a composition's tools as an MCP server, for native agents.
 
 Organisation-wide concerns — collecting records centrally, policy on which
