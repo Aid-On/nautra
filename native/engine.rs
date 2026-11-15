@@ -24,6 +24,8 @@ use journal::Journal;
 use outbound::{Audit, Outbound};
 use tools::Tools;
 
+#[path = "engine/auth.rs"]
+mod auth;
 #[path = "engine/inspect.rs"]
 mod inspect;
 #[path = "engine/journal.rs"]

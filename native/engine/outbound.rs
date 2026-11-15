@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! What leaves a guest over `wasi:http`: which destinations it may reach,
-//! which secrets are put on which requests, and the record of both.
+//! which secrets are put on which requests, which requests are authenticated
+//! as the host, and the record of all three.
 //!
 //! `wasi:http` hands the host a whole request rather than a socket, so this is
 //! the one place every outbound HTTP request passes through, before any
@@ -19,6 +20,7 @@ use serde_json::{json, Value};
 use wasmtime_wasi_http::{Error, RequestOptions, WasiBody, WasiHttpHooks};
 
 use super::journal::Journal;
+use super::auth;
 use super::tools::{self, Tools};
 
 /// The record of what a run did at its boundary: one JSON object per line,
@@ -101,10 +103,94 @@ impl Secret {
     }
 }
 
+/// A destination whose requests are authenticated on the way out, as the
+/// host (ADR-0004). The guest holds nothing and writes nothing for it.
+///
+/// How is not known here. `scheme` and `params` are handed back, as they
+/// came, to nautra's answering copy, which knows the scheme; `body` is the
+/// one thing this side is told about it: whether each request's body is to
+/// be read whole and hashed.
+#[derive(Clone)]
+struct AuthGrant {
+    scheme: String,
+    params: Value,
+    host: String,
+    port: u16,
+    body: bool,
+}
+
+impl AuthGrant {
+    fn of(entry: &Value) -> Option<AuthGrant> {
+        Some(AuthGrant {
+            scheme: entry["scheme"].as_str()?.to_owned(),
+            params: entry["params"].clone(),
+            host: entry["host"].as_str()?.to_owned(),
+            port: u16::try_from(entry["port"].as_u64()?).ok()?,
+            body: entry["body"].as_bool().unwrap_or(false),
+        })
+    }
+
+    fn bound_to(&self, host: &str, port: u16) -> bool {
+        self.host.eq_ignore_ascii_case(host) && self.port == port
+    }
+}
+
+/// The largest body read whole for a scheme that asks for its hash.
+const MAX_HASHED_BODY: usize = 32 << 20;
+
+/// Authenticates `request` as `grant` says: describes it to nautra's
+/// answering copy, drops the headers the copy names — the scheme's own, so
+/// that a guest cannot bring credentials made elsewhere through a host
+/// nautra answers for — and puts on the ones it gives. `Err` is why not.
+async fn authenticate(request: http::Request<WasiBody>, grant: &AuthGrant) -> Result<http::Request<WasiBody>, String> {
+    use http_body_util::BodyExt;
+    use sha2::Digest;
+    let (mut parts, body) = request.into_parts();
+    let (body, digest) = if grant.body {
+        let read = http_body_util::Limited::new(body, MAX_HASHED_BODY)
+            .collect()
+            .await
+            .map_err(|_| format!("{} covers the whole body, and this one could not be read, or is over {} MiB", grant.scheme, MAX_HASHED_BODY >> 20))?
+            .to_bytes();
+        let digest: String = sha2::Sha256::digest(&read).iter().map(|byte| format!("{byte:02x}")).collect();
+        (whole(read), digest)
+    } else {
+        (body, String::new())
+    };
+    let host = match parts.headers.get(http::header::HOST).and_then(|value| value.to_str().ok()) {
+        Some(host) => host.to_owned(),
+        None => parts.uri.authority().map(|authority| authority.as_str().to_owned()).unwrap_or_default(),
+    };
+    // Every header the guest wrote, for the scheme to pick from.
+    let headers: Vec<Value> = parts.headers.iter().filter_map(|(name, value)| Some(json!([name.as_str(), value.to_str().ok()?]))).collect();
+    let question = json!({
+        "scheme": grant.scheme,
+        "params": grant.params,
+        "method": parts.method.as_str(),
+        "host": host,
+        "path": parts.uri.path(),
+        "query": parts.uri.query().unwrap_or(""),
+        "headers": headers,
+        "body_sha256": digest,
+    });
+    let answer = tokio::task::spawn_blocking(move || auth::ask(&question)).await.map_err(|error| error.to_string())??;
+    for name in &answer.remove {
+        parts.headers.remove(name.as_str());
+    }
+    for (name, value) in answer.set {
+        let name = http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| "the answer names a header that is not one".to_owned())?;
+        let mut value = HeaderValue::from_str(&value).map_err(|_| "the answer has a value no header can carry".to_owned())?;
+        value.set_sensitive(true);
+        parts.headers.insert(name, value);
+    }
+    Ok(http::Request::from_parts(parts, body))
+}
+
 /// The outbound policy of one guest.
 pub(super) struct Outbound {
     rules: Vec<(String, Option<u16>)>,
     secrets: Vec<Secret>,
+    auths: Vec<AuthGrant>,
     audit: Option<Arc<Audit>>,
     tools: Option<Arc<Tools>>,
     journal: Option<Arc<Journal>>,
@@ -114,6 +200,8 @@ pub(super) struct Outbound {
 struct Verdict {
     refusal: Option<String>,
     secrets: Vec<String>,
+    /// How the request is to be authenticated before it is sent, when it is.
+    auth: Option<AuthGrant>,
 }
 
 impl Outbound {
@@ -140,7 +228,11 @@ impl Outbound {
         for secret in &secrets {
             rules.extend(secret.hosts.iter().map(|(host, port)| (host.clone(), Some(*port))));
         }
-        Outbound { rules, secrets, audit, tools, journal }
+        // Naming a host to authenticate to is the same grant, for the same
+        // reason.
+        let auths: Vec<AuthGrant> = request["auth"].as_array().into_iter().flatten().filter_map(AuthGrant::of).collect();
+        rules.extend(auths.iter().map(|grant| (grant.host.clone(), Some(grant.port))));
+        Outbound { rules, secrets, auths, audit, tools, journal }
     }
 
     fn admits(&self, host: &str, port: u16) -> bool {
@@ -155,7 +247,7 @@ impl Outbound {
     /// connection, the URL itself — refuses the request: the guest is trying
     /// to send a secret somewhere it was not bound to go.
     fn decide(&self, request: &mut http::Request<WasiBody>, host: &str, port: u16, secure: bool) -> Verdict {
-        let mut verdict = Verdict { refusal: None, secrets: Vec::new() };
+        let mut verdict = Verdict { refusal: None, secrets: Vec::new(), auth: None };
         if !self.admits(host, port) {
             verdict.refusal = Some("the destination is not granted".into());
             return verdict;
@@ -182,6 +274,13 @@ impl Outbound {
             }
             if verdict.refusal.is_some() {
                 return verdict;
+            }
+        }
+        if let Some(grant) = self.auths.iter().find(|grant| grant.bound_to(host, port)) {
+            if !secure && !is_loopback(host) {
+                verdict.refusal = Some("requests to this destination are authenticated as the host, and not sent over an unencrypted connection".into());
+            } else {
+                verdict.auth = Some(grant.clone());
             }
         }
         verdict
@@ -236,8 +335,17 @@ fn whole(bytes: Bytes) -> WasiBody {
 }
 
 /// A request sent as it is, its response streamed back: an ordinary run.
-async fn send_live(request: http::Request<WasiBody>, options: Option<RequestOptions>, verdict: Verdict, mut record: Value, audit: Option<Arc<Audit>>) -> Sent {
+async fn send_live(request: http::Request<WasiBody>, options: Option<RequestOptions>, mut verdict: Verdict, mut record: Value, audit: Option<Arc<Audit>>) -> Sent {
     use http_body_util::BodyExt;
+    // Authenticated last, here, so that a replay — which sends nothing —
+    // asks for nothing. A request that cannot be authenticated is not sent.
+    let mut request = Some(request);
+    if let (None, Some(grant)) = (&verdict.refusal, verdict.auth.take()) {
+        match authenticate(request.take().expect("the request is still here"), &grant).await {
+            Ok(authenticated) => request = Some(authenticated),
+            Err(reason) => verdict.refusal = Some(format!("the request could not be authenticated: {reason}")),
+        }
+    }
     if let Some(reason) = verdict.refusal {
         record["reason"] = json!(reason);
         if let Some(audit) = &audit {
@@ -245,6 +353,7 @@ async fn send_live(request: http::Request<WasiBody>, options: Option<RequestOpti
         }
         return Err(Error::HttpRequestDenied);
     }
+    let Some(request) = request else { return Err(Error::HttpRequestDenied) };
     let sent = wasmtime_wasi_http::default_send_request(request, options).await;
     match &sent {
         Ok((response, _)) => record["status"] = json!(response.status().as_u16()),
@@ -339,7 +448,7 @@ impl WasiHttpHooks for Outbound {
         let verdict = self.decide(&mut request, &host, port, secure);
         // The audit names where a request went and what it carried, never
         // the query string or a header value.
-        let record = json!({
+        let mut record = json!({
             "kind": "http",
             "decision": if verdict.refusal.is_none() { "allow" } else { "deny" },
             "method": request.method().as_str(),
@@ -349,6 +458,9 @@ impl WasiHttpHooks for Outbound {
             "path": request.uri().path(),
             "secrets": verdict.secrets,
         });
+        if let Some(grant) = &verdict.auth {
+            record["auth"] = json!(grant.scheme);
+        }
         let audit = self.audit.clone();
         match self.journal.clone() {
             Some(journal) => Box::new(send_recorded(journal, request, options, verdict, record, audit)),

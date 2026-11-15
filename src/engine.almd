@@ -5,6 +5,7 @@
 import http
 import json
 import secret
+import self.authenticator
 import self.grants
 
 @extern(rs, "engine", "nt_run")
@@ -76,13 +77,26 @@ local fn secret_value(s: BoundSecret) -> Value = value.object([
   ("hosts", value.array(s.hosts |> list.map((rule) => value.object([("host", value.string(rule.host)), ("port", value.int(rule.port))])))),
 ])
 
+// A destination the engine has authenticated for. No key is here, and no
+// meaning: the engine hands `scheme` and `params` back, as they are, to
+// nautra's answering copy (authenticator.almd), which knows the scheme and
+// finds the credentials itself. `body` says whether to hash each body.
+local fn auth_value(a: authenticator.Resolved) -> Value = value.object([
+  ("scheme", value.string(a.scheme)),
+  ("host", value.string(a.host.host)),
+  ("port", value.int(a.host.port)),
+  ("params", value.array(a.params |> list.map(((key, written)) => value.array([value.string(key), value.string(written)])))),
+  ("body", value.bool(a.body)),
+])
+
 // The request document the engine applies. `argv` starts with the name the
 // guest sees itself run as; `env` is already resolved to name/value pairs.
 // This is the one place a secret's real value is written out, and it goes
 // nowhere but to the engine in this process.
-fn request(path: String, argv: List[String], env: List[(String, String)], g: grants.Grants, secrets: List[BoundSecret]) -> Value =
+fn request(path: String, argv: List[String], env: List[(String, String)], g: grants.Grants, secrets: List[BoundSecret], auths: List[authenticator.Resolved]) -> Value =
   value.object([
     ("secrets", value.array(secrets |> list.map(secret_value))),
+    ("auth", value.array(auths |> list.map(auth_value))),
     ("audit", value.string(g.audit)),
     ("path", value.string(path)),
     ("args", value.array(argv |> list.map(value.string))),
@@ -136,7 +150,7 @@ effect fn spawn_self(args: List[String], log: String) -> Int = {
 }
 
 test "a request with no grants opens nothing" {
-  let req = request("/x/app.wasm", ["app"], [], grants.nothing(), [])
+  let req = request("/x/app.wasm", ["app"], [], grants.nothing(), [], [])
   assert_eq(value.get_array(req, "mounts"), some([]))
   assert_eq(value.get_array(req, "env"), some([]))
   assert_eq(value.get(req, "net"), some(value.object([("mode", value.string("none"))])))

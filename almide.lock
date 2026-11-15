@@ -1,3 +1,4 @@
 # almide.lock — auto-generated, do not edit
 
 porta_sandbox = { git = "https://github.com/almide/porta", ref = "develop", commit = "3c79e54adadcf0623bfe0fa9837d5079ccb572dd", subdir = "sandbox" }
+sigv4 = { git = "https://github.com/O6lvl4/sigv4", ref = "v0.1.0", commit = "7e91d2344e560ed4b1fffcd48c033bb8c710f087" }

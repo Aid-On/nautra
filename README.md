@@ -105,6 +105,7 @@ it belongs to the workload.
 | `-e NAME=VALUE`, `-e NAME` | one variable; a bare name copies the host's value |
 | `--allow-net HOST:PORT` | one destination; also `HOST`, `*:PORT`, or `*` for all |
 | `--secret NAME@HOST` | a host variable for HTTP requests to `HOST`; the workload holds a placeholder, never the value |
+| `--auth SCHEME@HOST` | HTTP requests to `HOST`, each authenticated by nautra as the host; the workload holds nothing |
 | `--audit FILE` | nothing — it appends every network decision of the run to `FILE` |
 | `-p [ADDRESS:]PORT` | where an HTTP service listens; this machine only unless an address is named |
 | `-i` | this terminal's stdin |
@@ -143,9 +144,37 @@ workload sends it in whatever header its client uses; on a request to
 carries it anywhere else is refused. The grant also opens HTTPS to that host,
 and nothing more. A host the secret is bound to is trusted with it.
 
+Some services take no key on the request: they want each request signed
+with one, or a token made from one. For those, `--auth` names the
+destination and the scheme, and nautra authenticates every request to it on
+the way out, as the host:
+
+```text
+$ export AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=…
+$ nautra run --auth sigv4@bedrock-runtime.us-east-1.amazonaws.com agent.wasm
+```
+
+The workload sends the request it would send to an open endpoint and holds
+nothing at all, not even a placeholder; an `Authorization` header of its own
+is replaced. The same workload runs against another provider by changing
+this line, not the program.
+
+`sigv4` is the one scheme so far: AWS Signature Version 4, which
+S3-compatible stores ask for too. The region and the service are read off an
+AWS host name; for any other host they are written, and `env` names the
+prefix of the host variables that hold the keys (`AWS` unless said):
+
+```text
+$ nautra run --auth sigv4@objects.example.com,region=auto,service=s3,env=STORE app.wasm
+```
+
+The credentials are not copied into the workload's environment. A signature
+covers the whole body, so a request over 32 MiB is refused. A scheme is one
+file; see [ADR-0004](docs/adr/0004-signed-requests.md) for what one is.
+
 `--audit FILE` appends one line of JSON per network decision — each HTTP
-request with its destination, path, status and the names of the secrets it
-carried, each refusal with its reason, each socket connection. It never
+request with its destination, path, status, the names of the secrets it
+carried and the scheme it was authenticated with, each refusal with its reason, each socket connection. It never
 records a header value, a query string or a secret.
 
 The workload's own exit code is passed through. `125` means nautra refused
@@ -206,8 +235,8 @@ The note says: THE TIDE IS IN
 ```
 
 The file says nothing a `run` line could not: each entry's `mounts`, `net`,
-`env`, `secrets`, `timeout`, `memory` and `fuel` are the options of the same
-names, read by the same parser. Paths in it are relative to the file. Options
+`env`, `secrets`, `auth`, `timeout`, `memory` and `fuel` are the options of
+the same names, read by the same parser. Paths in it are relative to the file. Options
 on the command line add to the `[agent]` entry.
 
 A tool is any command image: it gets the call's arguments as JSON on stdin
