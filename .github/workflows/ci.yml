@@ -14,7 +14,14 @@ permissions:
 
 jobs:
   linux:
-    runs-on: ubuntu-24.04
+    strategy:
+      # One architecture's failure says nothing about the other's.
+      fail-fast: false
+      matrix:
+        # arm64 is what the agent runtimes that take a container ask for
+        # (Amazon Bedrock AgentCore Runtime); x86-64 is what the rest do.
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     services:
       registry:
@@ -33,7 +40,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-${{ runner.os }}-${{ hashFiles('almide.toml') }}
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('almide.toml') }}
       - name: Almide
         run: bash scripts/install-almide.sh
       - name: Check
