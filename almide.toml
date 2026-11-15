@@ -19,8 +19,9 @@ proc = ["ps", "kill"]
 native = ["porta_sandbox"]
 
 [dependencies]
-# The branch that makes the sandbox a package; a tag once Porta releases it.
-porta_sandbox = { git = "https://github.com/almide/porta", branch = "sandbox-package", subdir = "sandbox" }
+# Porta's develop branch, pinned to a commit by almide.lock; a tag once Porta
+# releases with the package.
+porta_sandbox = { git = "https://github.com/almide/porta", branch = "develop", subdir = "sandbox" }
 
 # The only native code is the engine: wasmtime, the two parsers it needs (the
 # wasm binary format for `inspect`, TOML for the Nautrafile), and JSON Schema
