@@ -55,6 +55,22 @@ docker run -d --name nautra-test-registry -p 127.0.0.1:5057:5000 registry:2
 NAUTRA_TEST_REGISTRY=localhost:5057 python3 scripts/integration.py target/nautra
 ```
 
+## Releasing
+
+```bash
+# src/help.almd VERSION and almide.toml version say X.Y.Z, on main
+git tag vX.Y.Z && git push origin vX.Y.Z
+```
+
+`.github/workflows/release.yml` builds on Linux x86-64, Linux arm64 and macOS
+arm64, runs the integration suite against each binary on the machine that
+built it, and publishes the three archives with their checksums as a
+prerelease, plus `ghcr.io/aid-on/nautra:X.Y.Z` for linux/amd64 and
+linux/arm64 (`Dockerfile`, made from the tested binaries, each run before the
+push). A pull request that touches the workflow or the Dockerfile runs all of
+it and publishes nothing. The Linux binaries are linked on Ubuntu 24.04 and
+need glibc 2.39; the image carries its own.
+
 ## Invariants
 
 - A workload starts with nothing. A new capability is a new grant on `run`,
