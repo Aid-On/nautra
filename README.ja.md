@@ -213,6 +213,31 @@ env = ["MCP_URL=https://mcp.example.com/mcp", "MCP_TOOL=search"]
 secrets = ["MCP_TOKEN@mcp.example.com"]
 ```
 
+### ネイティブコマンド
+
+Nautra が閉じ込めるのは Wasm です。エージェントが git やコンパイラ、テストランナーのようなネイティブのプログラムを必要とするときは、ツールや検査の項目に `image` の代わりに `command` を書きます。Nautra はそれを姉妹プロジェクトの [Porta](https://github.com/almide/porta) に渡します。Porta は、ホストのカーネルでネイティブのプロセスを閉じ込めます。
+
+```toml
+[tools.git_log]
+command = ["git", "log", "--oneline", "-5"]
+description = "The last five commits."
+mounts = ["./repo:ro"]
+
+[checks.tests_pass]
+command = ["cargo", "test", "--offline"]
+finish = true
+mounts = ["./repo"]
+reads = "open"                           # ツールチェーンはマウントの外も読む
+```
+
+権限は Nautra の書き方で書き、Nautra がそれを Porta のオプションに変換します。既定の姿勢も Nautra のままです。ネットワークは書かなければ閉じています。読み取りは、`reads = "open"` と書かないかぎり、マウントとシステムのディレクトリに限ります。Wasm の項目と違う点が3つあります。ネイティブのプロセスは、閉じ込める対象として別物だからです。
+
+- マウントは、ホストのディレクトリをその場所のまま見せます（`DIR` か `DIR:ro`）。ゲスト側のパスはありません。コマンドは、最初のマウント先を作業ディレクトリとして始まります。
+- ネットワークは、ホスト名（HTTPS）かポート（`*:8080`）で許可します。アドレスでは許可できません。書かれたとおりに Porta が守らせられない項目は、緩めて実行せずに拒否します。
+- `memory` と `fuel` は使えません。Porta 固有のオプションは、`porta = ["--max-procs", "200"]` のように書いてそのまま渡せます。
+
+これらの項目を使うには、Porta をインストールしておく必要があります。Nautra のそれ以外の機能は、Porta なしで動きます。引数を標準入力から JSON で受け取り、標準出力が結果になる点は、Wasm のツールと同じです。
+
 ### 記録、再生、再開
 
 `--record FILE` を付けると、実行の境界を越えたやり取りを順番どおりに書き残します。外向きの HTTP リクエストとその応答、ツールの呼び出しとその結果が対象です。
@@ -333,7 +358,7 @@ OCI Distribution API に対応したレジストリなら、どれでも使え�
 
 **プレアルファです。** ここまでに書いた機能は動作し、macOS と CI 上の Linux で `scripts/integration.py` が検証しています。WASI 0.3 とその `wasi:http` は wasmtime でまだ実験的な扱いで、サービスの機能もその制約を受けます。push と pull はローカルの `registry:2` で検証済みですが、公開レジストリではまだ検証していません。
 
-エージェント向けの機能は、[ADR-0002](docs/adr/0002-agents.md) に書いた順番で作っています。残っているのは最後の1つ、ホストのカーネルでネイティブコマンドを閉じ込める機能（`nautra exec`）だけです。これは今も Porta の役目です。
+エージェント向けの機能は、[ADR-0002](docs/adr/0002-agents.md) に書いた順番で作っています。残っているのは、構成ファイルのツール群を MCP サーバとして公開する機能です。Porta の下で動くネイティブのエージェントが、それらのツールを使えるようになります。
 
 まだ無いもの：
 

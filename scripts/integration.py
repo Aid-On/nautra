@@ -14,6 +14,7 @@ import http.server
 import json
 import os
 import pathlib
+import shutil
 import signal
 import socket
 import subprocess
@@ -339,6 +340,52 @@ secrets = ["MCP_TOKEN@127.0.0.1:{remote}"]
     expect("the remote server saw the session and the real token", ("Bearer " + remote_token, "session-1", "tools/call") in calls, repr(calls))
 
 
+def native_checks(n, wasm, project):
+    """Native commands as tools and checks, confined by Porta. Skipped where Porta is not installed."""
+    porta = shutil.which("porta")
+    path = os.environ["PATH"]
+    repo = project / "repo"
+    repo.mkdir()
+    (repo / "note.txt").write_text("the tide is in\n")
+    (project / "native.toml").write_text(f"""
+[agent]
+image = "{wasm('toolcall')}"
+
+[tools.count_words]
+command = ["/usr/bin/wc", "-w"]
+description = "Count the words given."
+
+[tools.show]
+command = ["/bin/cat", "note.txt"]
+mounts = ["repo:ro"]
+
+[tools.scribble]
+command = ["/bin/sh", "-c", "echo x > new.txt"]
+mounts = ["repo:ro"]
+
+[checks.note_is_there]
+command = ["/bin/test", "-s", "note.txt"]
+finish = true
+mounts = ["repo:ro"]
+""")
+    call = lambda *args, **more: n("run", "-f", project / "native.toml", *args, **more)
+    check("without Porta a native command is refused, and says why", call("show", env={"PATH": "/usr/bin:/bin"}), 125, err="porta is not installed")
+    (project / "guest.toml").write_text(f'[agent]\nimage = "{wasm("toolcall")}"\n[tools.t]\ncommand = ["/bin/cat"]\nmounts = ["repo:/work"]\n')
+    check("a native command has no guest paths", n("run", "-f", project / "guest.toml"), 125, err="sees host directories where they are")
+    (project / "addr.toml").write_text(f'[agent]\nimage = "{wasm("toolcall")}"\n[tools.t]\ncommand = ["/bin/cat"]\nnet = ["10.0.0.1:443"]\n')
+    check("what Porta cannot enforce is refused, not loosened", n("run", "-f", project / "addr.toml"), 125, err="not to an address")
+    if not porta:
+        print("skip  native commands through Porta (porta is not installed)")
+        return
+    env = {"PATH": path}
+    check("a native tool gets its arguments on stdin", call("count_words", '{"text": "one two"}', env=env), 0, out="2")
+    check("a native tool reads its mount", call("show", env=env), 0, out="the tide is in")
+    check("a native tool cannot write a read-only mount", call("scribble", env=env), 0, out="tool error")
+    expect("nothing was written", not (repo / "new.txt").exists())
+    (repo / "note.txt").write_text("")
+    check("a native finish check refuses", call("show", env=env), 4, err="check note_is_there does not accept")
+
+
 def compose_checks(n, wasm, work):
     """nautra.toml: a workload and the tools it may call, each an image with its own grants."""
     project = work / "project"
@@ -425,6 +472,7 @@ mounts = ["ws:/work:ro"]
     check("an agent needs its key", n("run", "-f", project / "agent.toml", "task"), 125, err="MODEL_KEY is not set")
     record_checks(n, project, env, asked, token)
     team_checks(n, wasm, project, env, port, tools)
+    native_checks(n, wasm, project)
 
     started = n("run", "-d", "--name", "agent-bg", "-f", project / "agent.toml", "What does the note say?", env=env)
     check("a composition runs in the background", started, 0)

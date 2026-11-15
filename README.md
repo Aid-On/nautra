@@ -268,6 +268,43 @@ env = ["MCP_URL=https://mcp.example.com/mcp", "MCP_TOOL=search"]
 secrets = ["MCP_TOKEN@mcp.example.com"]
 ```
 
+### Native commands
+
+Nautra confines Wasm. When an agent needs a native program — git, a compiler,
+a test runner — a tool or a check names it with `command` in place of
+`image`, and nautra hands it to its sister, [Porta](https://github.com/almide/porta),
+which confines native processes with the host kernel.
+
+```toml
+[tools.git_log]
+command = ["git", "log", "--oneline", "-5"]
+description = "The last five commits."
+mounts = ["./repo:ro"]
+
+[checks.tests_pass]
+command = ["cargo", "test", "--offline"]
+finish = true
+mounts = ["./repo"]
+reads = "open"                           # a toolchain reads outside its mounts
+```
+
+The grants are nautra's words, turned into Porta's options, with nautra's
+stance kept: no network unless named, and reads confined to the mounts and
+the system directories unless `reads = "open"`. Three things differ from a
+Wasm entry, because a native process is a different thing to confine:
+
+- a mount is a host directory seen where it is (`DIR` or `DIR:ro`), with no
+  guest path; the command starts in its first mount;
+- network is granted by host name (over HTTPS) or by port (`*:8080`), not by
+  address — an entry Porta could not hold to its words is refused, not run
+  more openly;
+- `memory` and `fuel` do not apply; `porta = ["--max-procs", "200"]` passes
+  Porta's own options through.
+
+Porta has to be installed for these entries; everything else in nautra works
+without it. The arguments still arrive as JSON on stdin and the result is
+stdout.
+
 ### Record, replay, resume
 
 `--record FILE` writes down every exchange at a run's boundary, in order:
@@ -426,8 +463,8 @@ experimental in wasmtime, and services inherit that. Push and pull are tested ag
 `registry:2`, and have not yet been verified against public registries.
 
 Agents are being built in the order [ADR-0002](docs/adr/0002-agents.md)
-gives. Everything in it is in except the last step: confining native commands
-with the host kernel (`nautra exec`), which is still Porta's job.
+gives. What remains is publishing a composition's tools as an MCP server, so
+that a native agent running under Porta can use them.
 
 Not there yet:
 

@@ -1,7 +1,7 @@
 # ADR-0002: Agents
 
-Status: accepted (2026-11-15). Steps 1 to 4 of the order below are
-implemented; step 5 (`exec`) is not.
+Status: accepted (2026-11-15), §7 revised the same day. Steps 1 to 5 of the
+order below are implemented; step 6 is not.
 
 Nautra is to be an environment agents run in, and to do everything
 [Porta](https://github.com/almide/porta) does. Porta grew its agent runtime
@@ -135,15 +135,40 @@ workload sees it, so streaming is lost under `--record`.
 | `agent-journal` | `inspect` on a record |
 | `agent-resume`, `agent-replay` | `run --resume`, `replay` |
 | `serve` (an agent's tools as an MCP server) | publishing an image's tools over MCP |
-| `run <native command>`, `explain`, `--why`, `--snapshot` | `exec` (§7) |
+| `run <native command>`, `explain`, `--why`, `--snapshot` | stay Porta's; a native tool or check here is run through Porta (§7) |
 
-## 7. Native commands are `exec`, not `run`
+## 7. Native commands are Porta's, reached through nautra's words
 
-Confining a native process with the host kernel moves here from Porta as
-`nautra exec`, taking the same grant options as `run`. It is a separate verb
-because the guarantee is a different one: `run` is a Wasm sandbox that holds
-whatever the host is, `exec` is as strong as this platform's kernel
-facilities and says what it cannot enforce.
+*Revised 2026-11-15. The first form of this section moved Porta's kernel
+sandbox here as `nautra exec`. Porta continues as a sister project, so two
+copies of that code would have to be kept equally strong; there is no `exec`.*
+
+Nautra confines Wasm, and that guarantee holds whatever the host is. A native
+process can only be confined by the host kernel, as strongly as this platform
+allows — that is Porta's work, and it stays Porta's.
+
+Where an agent here needs a native program — git, a compiler, a test runner —
+a tool or a check entry names it with `command = […]` in place of `image`, and
+nautra hands it to Porta to confine. The entry's grants are written in
+nautra's words and turned into Porta's options (`src/native.almd`), keeping
+nautra's stance: no network unless named, reads confined to the mounts and
+the system directories unless `reads = "open"`. `porta = […]` passes Porta
+options through for what only Porta has a word for.
+
+Where Porta cannot hold a native process to what nautra's words would
+promise, the entry is refused rather than run more openly: a mount has no
+guest path (a native command sees a host directory where it is), and network
+is granted by host name over HTTPS or by port, never by address.
+
+**Independence.** Nautra must be usable alone: everything Wasm works with no
+Porta installed, and an entry that needs it says so. Today that entry runs
+the installed `porta`. The intended form is for Porta to publish its sandbox
+as a package nautra builds in, so that one nautra binary is enough; the
+entries in `nautra.toml` do not change when that happens.
+
+The other direction — a native agent running under Porta, using nautra's
+tools — is nautra publishing a composition's tools as an MCP server on
+stdio. It is not built yet.
 
 ## 8. Porta's guest protocol is not carried over
 
@@ -157,7 +182,9 @@ written for them is ported by making it speak MCP over HTTP.
 2. Tools as images, the composition file, and a sample agent in Almide. *(done)*
 3. `--record`, `replay`, resume. *(done, without clock and randomness)*
 4. Checks, delegation, remote MCP. *(done)*
-5. `exec`.
+5. Native commands as tools and checks, through Porta. *(done, by running the
+   installed `porta`; building it in waits on Porta publishing a package)*
+6. Publishing a composition's tools as an MCP server, for native agents.
 
 Organisation-wide concerns — collecting records centrally, policy on which
 images may be pulled and which grants and secrets may be given, signing

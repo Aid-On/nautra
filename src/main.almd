@@ -15,6 +15,7 @@ import self.engine
 import self.grants
 import self.help
 import self.image
+import self.native
 import self.oci
 import self.reference
 import self.registry
@@ -171,6 +172,14 @@ local fn entry_line(options: List[String], image_text: String, audit: String, wh
   { ...parsed, grants: { ...parsed.grants, audit: audit } }
 }
 
+// The request of a native command: Porta, and the arguments that were
+// worked out for it from the entry's grants.
+local effect fn native_request(args: List[String]) -> Value =
+  value.object([("native", value.object([
+    ("program", value.string(native.porta()!)),
+    ("args", value.array(args |> list.map(value.string))),
+  ]))])
+
 // One tool as the engine needs it: its name and schema for the workload to
 // see, and the whole request it runs under each time it is called — decided
 // now, before anything starts. A tool that is an agent brings its own tools.
@@ -178,7 +187,9 @@ local fn entry_line(options: List[String], image_text: String, audit: String, wh
 // recorded result, so nothing is prepared.
 local effect fn tool_entry(t: compose.Tool, audit: String, live: Bool, depth: Int) -> Value = {
   let what = "tool ${t.name}"
-  let request = if not live then value.null() else if t.agent == "" then {
+  let request = if not live then value.null() else if not list.is_empty(t.native) then {
+    native_request(t.native) |> result.map_err((e) => "${what}: ${e}")!
+  } else if t.agent == "" then {
     prepare(entry_line(t.options, t.image, audit, what)!, "", []) |> result.map_err((e) => "${what}: ${e}")!
   } else {
     guard depth < MAX_DEPTH else err("${what}: agents hand work on more than ${MAX_DEPTH} deep; ${t.agent} may be naming itself")!
@@ -199,7 +210,9 @@ local effect fn tool_entry(t: compose.Tool, audit: String, live: Bool, depth: In
 
 local effect fn check_entry(c: compose.Check, audit: String, live: Bool) -> Value = {
   let what = "check ${c.name}"
-  let request = if live then prepare(entry_line(c.options, c.image, audit, what)!, "", []) |> result.map_err((e) => "${what}: ${e}")! else value.null()
+  let request = if not live then value.null()
+    else if not list.is_empty(c.native) then native_request(c.native) |> result.map_err((e) => "${what}: ${e}")!
+    else prepare(entry_line(c.options, c.image, audit, what)!, "", []) |> result.map_err((e) => "${what}: ${e}")!
   value.object([
     ("name", value.string(c.name)),
     ("before", value.array(c.before |> list.map(value.string))),

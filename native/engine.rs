@@ -28,6 +28,8 @@ use tools::Tools;
 mod inspect;
 #[path = "engine/journal.rs"]
 mod journal;
+#[path = "engine/native.rs"]
+mod native;
 #[path = "engine/outbound.rs"]
 mod outbound;
 #[path = "engine/serve.rs"]
@@ -167,8 +169,12 @@ fn run(request: &Value) -> Value {
 }
 
 /// Runs a workload with `stdin` as its input and returns what it wrote. This
-/// is how a tool is called.
+/// is how a tool or a check is called, whether it is a Wasm image or a native
+/// command handed to Porta.
 fn run_captured(request: &Value, stdin: Vec<u8>) -> Captured {
+    if native::is_native(request) {
+        return native::run_native(request, stdin);
+    }
     let capture = Capture { stdin, out: MemoryOutputPipe::new(tools::MAX_BYTES), err: MemoryOutputPipe::new(tools::MAX_BYTES) };
     let report = run_with(request, Some(&capture));
     Captured {

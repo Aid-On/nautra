@@ -10,14 +10,19 @@ import fs
 import path
 import self.engine
 import self.grants
+import self.native
 
 // A tool: an image started fresh for each call, with its own options. When
 // `agent` names another composition file, the tool is that whole
 // composition — an agent with tools of its own — given one argument, `task`.
+//
+// When `native` is not empty the tool is a native command, and these are the
+// arguments Porta is run with to confine it (see native.almd).
 type Tool = {
   name: String,
   image: String,
   agent: String,
+  native: List[String],
   options: List[String],
   description: String,
   input: Value,
@@ -29,6 +34,7 @@ type Tool = {
 type Check = {
   name: String,
   image: String,
+  native: List[String],
   options: List[String],
   before: List[String],
   finish: Bool,
@@ -103,6 +109,22 @@ local fn grant_options(table: Value, base: String, where: String) -> List[String
 local fn is_tool_name(name: String) -> Bool =
   name != "" and string.len(name) <= 64 and string.to_list(name) |> list.all((c) => (string.is_alphanumeric(c) and string.byte_len(c) == 1) or c == "_" or c == "-")
 
+local let NATIVE_KEYS = ["command", "mounts", "net", "env", "secrets", "timeout", "reads", "porta"]
+
+// The Porta arguments of an entry that names a native command.
+local fn native_args(table: Value, base: String, where: String) -> List[String]! =
+  native.porta_args(
+    strings(table, "command", where)!,
+    base,
+    strings(table, "mounts", where)!,
+    strings(table, "net", where)!,
+    strings(table, "env", where)!,
+    strings(table, "secrets", where)!,
+    text(table, "timeout", where)!,
+    text(table, "reads", where)! ?? "strict",
+    strings(table, "porta", where)!,
+  ) |> result.map_err((e) => "${where} ${e}")
+
 local let TASK_INPUT = value.object([
   ("type", value.string("object")),
   ("properties", value.object([("task", value.object([("type", value.string("string")), ("description", value.string("What to do, in full: the agent is told nothing else."))]))])),
@@ -113,37 +135,54 @@ local let TASK_INPUT = value.object([
 local fn tool(name: String, table: Value, base: String) -> Tool! = {
   let where = "[tools.${name}]"
   guard is_tool_name(name) else err("'${name}' is not a tool name: use letters, digits, '_' and '-'")
-  only_keys(table, ["image", "agent", "description", "input", "max_calls"] + GRANT_KEYS, where)!
+  only_keys(table, ["image", "agent", "command", "description", "input", "max_calls", "reads", "porta"] + GRANT_KEYS, where)!
   let image = text(table, "image", where)!
   let agent = text(table, "agent", where)!
+  let command = option.is_some(value.get(table, "command"))
   let description = text(table, "description", where)! ?? ""
   let max_calls = count(table, "max_calls", where)!
-  match (image, agent) {
-    (some(i), none) => {
-      let input = value.get(table, "input") ?? value.object([("type", value.string("object"))])
-      guard result.is_ok(value.as_object(input)) else err("${where} input must be a JSON Schema object")
-      Tool { name: name, image: image_at(base, i), agent: "", options: grant_options(table, base, where)!, description: description, input: input, max_calls: max_calls }
+  let input = value.get(table, "input") ?? value.object([("type", value.string("object"))])
+  guard result.is_ok(value.as_object(input)) else err("${where} input must be a JSON Schema object")
+  match (image, agent, command) {
+    (some(i), none, false) => {
+      only_keys(table, ["image", "description", "input", "max_calls"] + GRANT_KEYS, "${where}, which names an image,")!
+      Tool { name: name, image: image_at(base, i), agent: "", native: [], options: grant_options(table, base, where)!, description: description, input: input, max_calls: max_calls }
     },
-    (none, some(file)) => {
+    (none, some(file), false) => {
       // An agent's grants and input are its own file's business.
       only_keys(table, ["agent", "description", "max_calls"], "${where}, which names an agent,")!
-      Tool { name: name, image: "", agent: beside(base, file), options: [], description: description, input: TASK_INPUT, max_calls: max_calls }
+      Tool { name: name, image: "", agent: beside(base, file), native: [], options: [], description: description, input: TASK_INPUT, max_calls: max_calls }
     },
-    _ => err("${where} needs either an image or an agent"),
+    (none, none, true) => {
+      only_keys(table, ["description", "input", "max_calls"] + NATIVE_KEYS, "${where}, which names a native command,")!
+      Tool { name: name, image: "", agent: "", native: native_args(table, base, where)!, options: [], description: description, input: input, max_calls: max_calls }
+    },
+    _ => err("${where} needs exactly one of: image, agent, command"),
   }
 }
 
 local fn check(name: String, table: Value, base: String) -> Check! = {
   let where = "[checks.${name}]"
-  only_keys(table, ["image", "before", "finish"] + GRANT_KEYS, where)!
-  let image = text(table, "image", where)! |> option.to_result("${where} needs an image")!
+  only_keys(table, ["image", "command", "before", "finish", "reads", "porta"] + GRANT_KEYS, where)!
+  let image = text(table, "image", where)!
+  let command = option.is_some(value.get(table, "command"))
+  guard option.is_some(image) != command else err("${where} needs exactly one of: image, command")
   let before = strings(table, "before", where)!
   let finish = match value.get(table, "finish") {
     some(v) => value.as_bool(v) |> result.map_err((_) => "${where} finish must be true or false")!,
     none => false,
   }
   guard finish or not list.is_empty(before) else err("${where} says neither `before = [tools]` nor `finish = true`, so it would never run")
-  Check { name: name, image: image_at(base, image), options: grant_options(table, base, where)!, before: before, finish: finish }
+  match image {
+    some(i) => {
+      only_keys(table, ["image", "before", "finish"] + GRANT_KEYS, "${where}, which names an image,")!
+      Check { name: name, image: image_at(base, i), native: [], options: grant_options(table, base, where)!, before: before, finish: finish }
+    },
+    none => {
+      only_keys(table, ["before", "finish"] + NATIVE_KEYS, "${where}, which names a native command,")!
+      Check { name: name, image: "", native: native_args(table, base, where)!, options: [], before: before, finish: finish }
+    },
+  }
 }
 
 local fn entries(doc: Value, key: String) -> List[(String, Value)]! = match value.get(doc, key) {
@@ -297,4 +336,23 @@ test "a tool is an image or an agent, and a check has an occasion" {
   assert(result.is_err(with(value.object([("t", value.object([("agent", value.string("f")), ("mounts", value.array([]))]))]), none_yet)))
   assert(result.is_err(with(none_yet, value.object([("c", value.object([("image", value.string("i"))]))]))))
   assert(result.is_err(with(none_yet, value.object([("c", value.object([("image", value.string("i")), ("before", value.array([value.string("absent")]))]))]))))
+}
+
+test "a tool or a check may be a native command, confined by Porta" {
+  let doc = value.object([
+    ("agent", value.object([("image", value.string("a.wasm"))])),
+    ("tools", value.object([
+      ("log", value.object([("command", value.array([value.string("git"), value.string("log")])), ("mounts", value.array([value.string("repo:ro")]))])),
+    ])),
+    ("checks", value.object([
+      ("tests", value.object([("command", value.array([value.string("make"), value.string("test")])), ("finish", value.bool(true)), ("reads", value.string("open"))])),
+    ])),
+  ])
+  let c = parse(doc, "/p")!
+  assert_eq((list.first(c.tools) ?? panic("no tool")).native, ["run", "git", "-v", "/p/repo:ro", "--no-net", "--read-policy", "strict", "--", "log"])
+  assert_eq((list.first(c.checks) ?? panic("no check")).native, ["run", "make", "--no-net", "--read-policy", "open", "--", "test"])
+  let both = value.object([("agent", value.object([("image", value.string("a.wasm"))])), ("tools", value.object([("t", value.object([("image", value.string("i")), ("command", value.array([value.string("x")]))]))]))])
+  assert(result.is_err(parse(both, ".")))
+  let fuel = value.object([("agent", value.object([("image", value.string("a.wasm"))])), ("tools", value.object([("t", value.object([("command", value.array([value.string("x")])), ("fuel", value.int(5))]))]))])
+  assert(result.is_err(parse(fuel, ".")))
 }
