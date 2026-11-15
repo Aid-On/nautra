@@ -190,8 +190,60 @@ local fn entries(doc: Value, key: String) -> List[(String, Value)]! = match valu
   none => [],
 }
 
+// A composition with `[mcp]` in place of `[agent]`: it runs no workload and
+// publishes its tools as an MCP server, for an agent that lives elsewhere.
+// `token` names the host variable holding the bearer token a caller must
+// present; it is "" when the file says `open = true` or listens on this
+// machine only.
+type Published = {
+  listen: String,
+  token: String,
+  audit: String,
+  tools: List[Tool],
+  checks: List[Check],
+}
+
+fn publishes(doc: Value) -> Bool = option.is_some(value.get(doc, "mcp"))
+
+local fn is_loopback(address: String) -> Bool =
+  string.starts_with(address, "127.") or string.starts_with(address, "[::1]:") or string.starts_with(address, "localhost:")
+
+fn parse_published(doc: Value, base: String) -> Published! = {
+  guard option.is_none(value.get(doc, "agent")) else err("nautra.toml has both [agent] and [mcp]: a file runs an agent with its tools, or publishes the tools, not both")
+  only_keys(doc, ["mcp", "tools", "checks"], "nautra.toml")!
+  let table = value.get(doc, "mcp") |> option.to_result("nautra.toml needs an [mcp] table")!
+  only_keys(table, ["listen", "token", "open", "audit"], "[mcp]")!
+  let listen = grants.parse_publish(text(table, "listen", "[mcp]")! |> option.to_result("[mcp] needs listen = \"PORT\" or \"ADDRESS:PORT\"")!) |> result.map_err((e) => "[mcp] listen: ${e}")!
+  let token = text(table, "token", "[mcp]")! ?? ""
+  let open = match value.get(table, "open") {
+    some(v) => value.as_bool(v) |> result.map_err((_) => "[mcp] open must be true or false")!,
+    none => false,
+  }
+  guard not (open and token != "") else err("[mcp] says both `open = true` and a token; it is one or the other")
+  // Whoever reaches the address can call the tools. Beyond this machine that
+  // is never left unsaid.
+  guard token != "" or open or is_loopback(listen) else err("[mcp] listens on ${listen}, beyond this machine, and does not say who may call: name a host variable holding a bearer token (`token = \"MCP_TOKEN\"`), or write `open = true` where something in front of nautra decides that")
+  let tools = entries(doc, "tools")! |> list.map(((name, table)) => tool(name, table, base)!)!
+  guard not list.is_empty(tools) else err("[mcp] publishes the file's tools, and it has none")
+  let checks = entries(doc, "checks")! |> list.map(((name, table)) => check(name, table, base)!)!
+  for c in checks {
+    guard not c.finish else err("[checks.${c.name}] is a finish check, and published tools have no run that finishes; set it `before` a tool")
+    for named in c.before {
+      guard named == "*" or list.any(tools, (t) => t.name == named) else err("[checks.${c.name}] is set before '${named}', which is not one of the tools")
+    }
+  }
+  Published {
+    listen: listen,
+    token: token,
+    audit: match text(table, "audit", "[mcp]")! { some(a) => beside(base, a), none => "" },
+    tools: tools,
+    checks: checks,
+  }
+}
+
 // Reads a parsed composition file. `base` is the directory the file is in.
 fn parse(doc: Value, base: String) -> Composition! = {
+  guard not publishes(doc) else err("this file publishes its tools ([mcp]) and has no agent to run; give it to `nautra run -f` on its own")
   only_keys(doc, ["agent", "tools", "checks"], "nautra.toml")!
   let agent = value.get(doc, "agent") |> option.to_result("nautra.toml needs an [agent] table")!
   only_keys(agent, ["image", "args", "publish", "audit", "max_tool_calls"] + GRANT_KEYS, "[agent]")!
@@ -240,6 +292,21 @@ fn split_file(args: List[String]) -> (String, List[String], List[String]) = {
 // Turns a `run` line that names a composition file into the line it stands
 // for, and returns the composition beside it. Options on the command line
 // come after the file's, so they add to it.
+// The composition a `run` line names, when it is one that publishes tools.
+// Such a file is the whole line: there is no workload for an option or an
+// argument to belong to.
+effect fn published(args: List[String]) -> Published? = {
+  let (file, options, rest) = split_file(args)
+  if file == "" then none else {
+    let source = fs.read_text(file) |> result.map_err((e) => "cannot read ${file}: ${e}")!
+    let doc = engine.toml(source) |> result.map_err((e) => "${file}: ${e}")!
+    if not publishes(doc) then none else {
+      guard list.is_empty(options) and list.is_empty(rest) else err("${file} publishes tools and runs no workload, so it takes no other option or argument; say it in the file")!
+      some(parse_published(doc, path.dirname(file)) |> result.map_err((e) => "${file}: ${e}")!)
+    }
+  }
+}
+
 effect fn expand(args: List[String]) -> (List[String], Composition?) = {
   let (file, options, rest) = split_file(args)
   if file == "" then (args, none) else {
@@ -361,4 +428,31 @@ test "a tool or a check may be a native command" {
   assert(result.is_err(parse(both, ".")))
   let fuel = value.object([("agent", value.object([("image", value.string("a.wasm"))])), ("tools", value.object([("t", value.object([("command", value.array([value.string("x")])), ("fuel", value.int(5))]))]))])
   assert(result.is_err(parse(fuel, ".")))
+}
+
+local fn published_doc(mcp: List[(String, Value)], extra: List[(String, Value)]) -> Value = value.object([
+  ("mcp", value.object(mcp)),
+  ("tools", value.object([("upper", value.object([("image", value.string("upper.wasm"))]))])),
+] + extra)
+
+test "a file with [mcp] publishes its tools" {
+  let p = parse_published(published_doc([("listen", value.string("8000")), ("audit", value.string("calls.jsonl"))], []), "/p")!
+  assert_eq(p.listen, "127.0.0.1:8000")
+  assert_eq(p.token, "")
+  assert_eq(p.audit, "/p/calls.jsonl")
+  assert_eq(list.map(p.tools, (t) => t.name), ["upper"])
+  let named = parse_published(published_doc([("listen", value.string("0.0.0.0:8000")), ("token", value.string("MCP_TOKEN"))], []), "/p")!
+  assert_eq(named.token, "MCP_TOKEN")
+  assert(result.is_ok(parse_published(published_doc([("listen", value.string("0.0.0.0:8000")), ("open", value.bool(true))], []), "/p")))
+}
+
+test "tools are not published beyond this machine without a word on who may call" {
+  assert(result.is_err(parse_published(published_doc([("listen", value.string("0.0.0.0:8000"))], []), "/p")))
+  assert(result.is_err(parse_published(published_doc([("listen", value.string("0.0.0.0:8000")), ("open", value.bool(true)), ("token", value.string("T"))], []), "/p")))
+  assert(result.is_err(parse_published(published_doc([], []), "/p")))
+  assert(result.is_err(parse_published(published_doc([("listen", value.string("8000"))], [("agent", value.object([("image", value.string("a.wasm"))]))]), "/p")))
+  assert(result.is_err(parse_published(value.object([("mcp", value.object([("listen", value.string("8000"))]))]), "/p")))
+  let finish = [("checks", value.object([("c", value.object([("image", value.string("c.wasm")), ("finish", value.bool(true))]))]))]
+  assert(result.is_err(parse_published(published_doc([("listen", value.string("8000"))], finish), "/p")))
+  assert(result.is_err(parse(published_doc([("listen", value.string("8000"))], []), "/p")))
 }

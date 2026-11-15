@@ -268,6 +268,34 @@ env = ["MCP_URL=https://mcp.example.com/mcp", "MCP_TOOL=search"]
 secrets = ["MCP_TOKEN@mcp.example.com"]
 ```
 
+### Publishing tools to an agent that runs elsewhere
+
+An agent does not have to be Wasm, or run under nautra, to use these tools. A
+file with `[mcp]` in place of `[agent]` publishes its tools as an MCP server:
+
+```toml
+[mcp]
+listen = "8000"            # PORT (this machine) or ADDRESS:PORT
+token = "MCP_TOKEN"        # the host variable holding the callers' bearer token
+audit = "calls.jsonl"
+
+[tools.read_file]
+image = "ghcr.io/you/read-file:v1"
+mounts = ["./ws:/work:ro"]
+```
+
+```console
+$ MCP_TOKEN=… nautra run -f tools.toml
+nautra: tools published at http://127.0.0.1:8000/mcp
+```
+
+Each call is what it is inside a run: arguments checked against the schema,
+`before` checks first, a fresh instance under the tool's own grants, the call
+recorded. Whoever reaches the address can call the tools, so beyond this
+machine the file must say who may: a `token`, or `open = true` where a
+platform in front of nautra authenticates. Requests are JSON-RPC over
+`POST /mcp`. See [ADR-0003](docs/adr/0003-platforms.md).
+
 ### Native commands
 
 Nautra confines Wasm. When an agent needs a native program — git, a compiler,
@@ -469,9 +497,10 @@ on macOS and, in CI, on Linux. WASI 0.3 and its `wasi:http` are still marked
 experimental in wasmtime, and services inherit that. Push and pull are tested against a local
 `registry:2`, and have not yet been verified against public registries.
 
-Agents are being built in the order [ADR-0002](docs/adr/0002-agents.md)
-gives. What remains is publishing a composition's tools as an MCP server, so
-that a native agent running under Porta can use them.
+The agent work in [ADR-0002](docs/adr/0002-agents.md) is built. Running on
+hosted agent platforms is [ADR-0003](docs/adr/0003-platforms.md): nautra's
+side is tested on Linux x86-64 and arm64, and nothing has been run on the
+platforms themselves yet.
 
 Not there yet:
 

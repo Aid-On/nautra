@@ -45,9 +45,13 @@ pub fn nt_serve(request_json: &str) -> String {
 }
 
 fn serve(request: Value) -> Result<Value, String> {
-    let path = request["path"].as_str().ok_or("serve request has no path")?.to_owned();
     let listen = request["listen"].as_str().ok_or("serve request has no address")?;
     let address: SocketAddr = listen.parse().map_err(|_| format!("'{listen}' is not an address to listen on"))?;
+    // No workload: what is published is the composition's tools themselves.
+    let path = match request["path"].as_str() {
+        Some(path) if !path.is_empty() => path.to_owned(),
+        _ => return publish_tools(address, &request),
+    };
     let bytes = std::fs::read(&path).map_err(|error| format!("cannot read {path}: {error}"))?;
     if !inspect::is_component(&bytes) {
         return Err("-p publishes an HTTP service, and this is a core module with no HTTP handler".into());
@@ -243,4 +247,78 @@ async fn respond(handler: ProxyHandler<Serving>, request: hyper::Request<Incomin
             Ok(response)
         }
     }
+}
+
+/// A composition's tools published as an MCP server: the caller is whoever
+/// connects, where in a run it is the workload. Each call is the same fresh,
+/// captured run under the tool's own grants, checked and recorded the same
+/// way. Requests are JSON-RPC over `POST /mcp`, answered whole.
+fn publish_tools(address: SocketAddr, request: &Value) -> Result<Value, String> {
+    let audit = Audit::of(request)?;
+    let tools = Tools::of(request, audit, None)?.ok_or("there are no tools to publish")?;
+    let token = request["token"].as_str().filter(|token| !token.is_empty()).map(str::to_owned);
+    wasmtime_wasi::runtime::in_tokio(listen_for_tools(address, tools, Arc::new(token)))?;
+    Ok(json!({ "exit_code": 0 }))
+}
+
+async fn listen_for_tools(address: SocketAddr, tools: Arc<Tools>, token: Arc<Option<String>>) -> Result<(), String> {
+    let listener = tokio::net::TcpListener::bind(address).await.map_err(|error| format!("cannot listen on {address}: {error}"))?;
+    let bound = listener.local_addr().map_err(|error| error.to_string())?;
+    eprintln!("nautra: tools published at http://{bound}/mcp");
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|error| error.to_string())?;
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let Ok((stream, _)) = accepted else { continue };
+                let (tools, token) = (tools.clone(), token.clone());
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(move |request| answer_mcp(tools.clone(), token.clone(), request));
+                    let connection = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(stream), service);
+                    let _ = connection.await;
+                });
+            }
+            _ = tokio::signal::ctrl_c() => return Ok(()),
+            _ = terminate.recv() => return Ok(()),
+        }
+    }
+}
+
+/// Whether a request presents the token, compared without stopping at the
+/// first byte that differs.
+fn presents(headers: &http::HeaderMap, token: &str) -> bool {
+    let given = headers.get(http::header::AUTHORIZATION).and_then(|value| value.to_str().ok()).and_then(|value| value.strip_prefix("Bearer ")).unwrap_or("");
+    given.len() == token.len() && given.bytes().zip(token.bytes()).fold(0u8, |differs, (a, b)| differs | (a ^ b)) == 0
+}
+
+async fn answer_mcp(tools: Arc<Tools>, token: Arc<Option<String>>, request: hyper::Request<Incoming>) -> Result<hyper::Response<http_body_util::Full<Bytes>>, std::convert::Infallible> {
+    use http_body_util::BodyExt;
+    let plain = |status: http::StatusCode, text: &str| {
+        let mut response = hyper::Response::new(http_body_util::Full::new(Bytes::from(text.to_owned())));
+        *response.status_mut() = status;
+        response
+    };
+    if !matches!(request.uri().path(), "/mcp" | "/") {
+        return Ok(plain(http::StatusCode::NOT_FOUND, "the tools are at /mcp\n"));
+    }
+    if request.method() != http::Method::POST {
+        let mut response = plain(http::StatusCode::METHOD_NOT_ALLOWED, "MCP requests are POSTed here\n");
+        response.headers_mut().insert(http::header::ALLOW, http::HeaderValue::from_static("POST"));
+        return Ok(response);
+    }
+    if let Some(token) = token.as_deref() {
+        if !presents(request.headers(), token) {
+            let mut response = plain(http::StatusCode::UNAUTHORIZED, "a bearer token is required\n");
+            response.headers_mut().insert(http::header::WWW_AUTHENTICATE, http::HeaderValue::from_static("Bearer"));
+            return Ok(response);
+        }
+    }
+    let body = match http_body_util::Limited::new(request.into_body(), super::tools::MAX_BYTES).collect().await {
+        Ok(body) => body.to_bytes(),
+        Err(_) => return Ok(plain(http::StatusCode::PAYLOAD_TOO_LARGE, "the request is too large\n")),
+    };
+    let answer = tools.answer(&body).await;
+    let mut response = hyper::Response::new(http_body_util::Full::new(Bytes::from(answer.body)));
+    *response.status_mut() = http::StatusCode::from_u16(answer.status).unwrap_or(http::StatusCode::OK);
+    response.headers_mut().insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
+    Ok(response)
 }
