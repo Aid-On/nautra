@@ -288,7 +288,7 @@ impl Tools {
 }
 
 /// What a run that did not succeed had to say for itself.
-fn said(outcome: &super::Captured) -> String {
+pub(super) fn said(outcome: &super::Captured) -> String {
     let said = [outcome.error.as_str(), outcome.stderr.trim_end(), outcome.stdout.trim_end()]
         .into_iter()
         .filter(|text| !text.is_empty())
@@ -337,7 +337,7 @@ fn reply(id: &Value, result: Result<Value, (i64, String)>) -> Answer {
 
 /// Runs one tool to its end on a thread of its own, so that the guest that
 /// called it keeps its place in the host's event loop while it waits.
-async fn run_tool(request: Value, stdin: Vec<u8>) -> super::Captured {
+pub(super) async fn run_tool(request: Value, stdin: Vec<u8>) -> super::Captured {
     let (done, wait) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
         let _ = done.send(super::run_captured(&request, stdin));

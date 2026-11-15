@@ -9,6 +9,7 @@
 // http://tools.nautra/, which nautra answers itself.
 import env
 import http
+import io
 import json
 
 let TOOLS = "http://tools.nautra/"
@@ -62,8 +63,22 @@ effect fn run_call(call: Value) -> Value = {
   ])
 }
 
+// The task: the arguments, as from a shell, or else what is on stdin, as
+// when each request to a published agent is one run (`[invoke]`). A request
+// body is the task itself, or JSON with it under `prompt` or `task`.
+effect fn task_given() -> String = {
+  let written = list.join(env.args(), " ")
+  if written != "" then written else {
+    let sent = string.trim(io.read_all())
+    match json.parse(sent) {
+      ok(doc) => value.get_string(doc, "prompt") ?? value.get_string(doc, "task") ?? sent,
+      err(_) => sent,
+    }
+  }
+}
+
 effect fn main() -> Unit = {
-  let task = list.join(env.args(), " ")
+  let task = task_given()!
   guard task != "" else err("give the agent a task")!
   let endpoint = env.get("MODEL_URL") |> option.to_result("MODEL_URL is not set")!
   let model = env.get("MODEL_NAME") ?? "default"

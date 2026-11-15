@@ -439,6 +439,102 @@ mounts = ["{repo}:ro"]
     shutil.rmtree(held, ignore_errors=True)
 
 
+def invoke_checks(n, wasm, project, model_port, tools, token):
+    """[invoke]: an agent that ends, published; each request is one whole run of it."""
+    port = free_port()
+    door = "door-token-s3cr3t"
+    (project / "invoked.toml").write_text(
+        f'[agent]\nimage = "{wasm("agent")}"\nsecrets = ["MODEL_KEY@127.0.0.1:{model_port}"]\n'
+        f'env = ["MODEL_URL=http://127.0.0.1:{model_port}/v1/chat/completions", "MODEL_NAME=fixture"]\nmax_tool_calls = 3\ntimeout = "30s"\n'
+        f'\n[invoke]\nlisten = "{port}"\ntoken = "DOOR_TOKEN"\n' + tools)
+    file = project / "invoked.toml"
+    (project / "invoked-beyond.toml").write_text(f'[agent]\nimage = "{wasm("hello")}"\n[invoke]\nlisten = "0.0.0.0:{port}"\n')
+    check("an agent is not published beyond this machine without saying who may call", n("run", "-f", project / "invoked-beyond.toml"), 125, err="does not say who may call")
+    check("a published agent's token must be set on the host", n("run", "-f", file, env={"MODEL_KEY": token}), 125, err="DOOR_TOKEN, which is not set")
+    check("a published agent is not recorded", n("run", "--record", project / "invoked.record", "-f", file, env={"MODEL_KEY": token, "DOOR_TOKEN": door}), 125, err="a record cannot replay")
+
+    def ask(body, auth=door, method="POST", path="/invocations"):
+        headers = {"Content-Type": "application/json", "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": "session-1"}
+        if auth:
+            headers["Authorization"] = "Bearer " + auth
+        request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=None if body is None else body.encode(), headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=60) as reply:
+                return reply.status, reply.read().decode(), reply.headers.get("Content-Type", "")
+        except urllib.error.HTTPError as error:
+            return error.code, error.read().decode(), error.headers.get("Content-Type", "")
+        except OSError as error:
+            return 0, str(error), ""
+
+    env = {"PATH": os.environ["PATH"], "HOME": str(n.home), "NAUTRA_HOME": str(n.home), "MODEL_KEY": token, "DOOR_TOKEN": door}
+    server = subprocess.Popen([n.binary, "run", "-f", str(file)], env=env, stderr=subprocess.PIPE, text=True, cwd=project)
+    try:
+        for _ in range(100):
+            if ask(None, method="GET", path="/ping")[0]:
+                break
+            time.sleep(0.05)
+        status, body, kind = ask(None, auth=None, method="GET", path="/ping")
+        expect("a published agent says it is up, to anyone", status == 200 and json.loads(body) == {"status": "Healthy"} and kind == "application/json", body)
+        status, body, kind = ask(json.dumps({"prompt": "What does the note say?"}))
+        expect("a request is one run of the agent, and its answer the reply", status == 200 and "The note says: THE TIDE IS IN" in body, f"{status} {body}")
+        status, body, _ = ask("What does the note say?")
+        expect("each request is a fresh run", status == 200 and "The note says: THE TIDE IS IN" in body, f"{status} {body}")
+        status, body, kind = ask("")
+        expect("a run that fails is a 500 that says why", status == 500 and "give the agent a task" in json.loads(body)["error"] and kind == "application/json", f"{status} {body}")
+        expect("a caller without the token is refused", ask("x", auth=None)[0] == 401)
+        expect("a request is a POST", ask(None, method="GET", path="/invocations")[0] == 405)
+        expect("no reply holds a secret", token not in body and door not in body)
+    finally:
+        server.send_signal(signal.SIGTERM)
+        try:
+            code = server.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            code = -1
+        said = server.stderr.read()
+    expect("a published agent stops cleanly when asked", code == 0, f"exit {code}: {said}")
+    expect("it says where it is published", f"http://127.0.0.1:{port}/invocations" in said, said)
+
+
+def platform_example_checks(n, wasm, work):
+    """examples/platforms: the files a container for a hosted platform holds, laid out as the Dockerfiles lay them out."""
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    for name, guests, table in (("agentcore", ["agent", "read_file", "upper"], "invoke"), ("cloudflare", ["read_file", "upper"], "mcp")):
+        home = work / f"platform-{name}"
+        home.mkdir()
+        for guest in guests:
+            shutil.copy(wasm(guest), home / f"{guest}.wasm")
+        shutil.copytree(repo / "examples" / "agent" / "workspace", home / "workspace")
+        port = free_port()
+        source = (repo / "examples" / "platforms" / name / "nautra.toml").read_text()
+        listens = [line for line in source.splitlines() if line.startswith("listen = ")]
+        expect(f"the {name} example listens beyond the container", len(listens) == 1 and "0.0.0.0:" in listens[0], repr(listens))
+        # Here it listens on loopback, on a port that is free.
+        (home / "nautra.toml").write_text(source.replace(listens[0], f'listen = "127.0.0.1:{port}"'))
+        env = {"PATH": os.environ["PATH"], "HOME": str(n.home), "NAUTRA_HOME": str(n.home), "MODEL_KEY": "k", "MCP_TOKEN": "t"}
+        server = subprocess.Popen([n.binary, "run", "-f", str(home / "nautra.toml")], env=env, stderr=subprocess.PIPE, text=True)
+        try:
+            up = 0
+            for _ in range(100):
+                up = fetch(f"http://127.0.0.1:{port}/ping")[0]
+                if up or server.poll() is not None:
+                    break
+                time.sleep(0.05)
+            expect(f"the {name} example starts and answers /ping", up == 200, server.stderr.read() if server.poll() is not None else f"status {up}")
+            if table == "mcp":
+                request = urllib.request.Request(f"http://127.0.0.1:{port}/mcp", headers={"Authorization": "Bearer t"},
+                    data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "read_file", "arguments": {"path": "notes/tide.txt"}}}).encode())
+                with urllib.request.urlopen(request, timeout=20) as reply:
+                    result = json.loads(reply.read())["result"]
+                expect(f"the {name} example's tool reads its workspace", not result["isError"], repr(result))
+        finally:
+            server.terminate()
+            try:
+                server.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                server.kill()
+
+
 def published_checks(n, wasm, project):
     """[mcp]: a composition's tools published as an MCP server, for an agent that runs elsewhere."""
     port = free_port()
@@ -603,8 +699,10 @@ mounts = ["ws:/work:ro"]
     check("an agent needs its key", n("run", "-f", project / "agent.toml", "task"), 125, err="MODEL_KEY is not set")
     record_checks(n, project, env, asked, token)
     team_checks(n, wasm, project, env, port, tools)
+    invoke_checks(n, wasm, project, port, tools, token)
     native_checks(n, wasm, project)
     published_checks(n, wasm, project)
+    platform_example_checks(n, wasm, work)
 
     started = n("run", "-d", "--name", "agent-bg", "-f", project / "agent.toml", "What does the note say?", env=env)
     check("a composition runs in the background", started, 0)

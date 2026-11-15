@@ -14,7 +14,8 @@ Every platform looked at so far wants one of two things from nautra.
 
 **The whole agent.** The platform runs a container and sends it HTTP
 requests. The container holds the nautra binary, a composition file and the
-images it names, and starts with `nautra run -f nautra.toml`. The platform
+images it names, and starts with `nautra run -f nautra.toml`; the file
+publishes the agent with `[invoke]` (§3). The platform
 isolates one session from another; nautra decides what the agent inside may
 do with its secrets, its tools and the network, and keeps the record. The two
 do not overlap.
@@ -22,6 +23,9 @@ do not overlap.
 **The tools alone.** The agent lives elsewhere — in the platform's own agent
 framework, or as a native process — and calls nautra's tools over MCP. Nautra
 runs no workload; it publishes a composition's tools on an address (§2).
+
+Both are a table in the composition file that says where to listen and who
+may call, and both are `run -f`.
 
 A platform that fits neither (one that takes a Wasm module and runs it in its
 own engine, such as Workers) is not a place nautra runs. Deploying an image
@@ -68,11 +72,49 @@ it is `run`, not a new verb: the file says what is run.
 Stdio, which ADR-0002 §7 named for a native agent on the same machine, is not
 built: an agent that can start a process can reach a loopback port.
 
-## 3. What the platforms ask for
+## 3. Publishing an agent: `[invoke]`
+
+An agent here is a workload that ends: it is given a task, works, writes its
+answer and exits. A platform wants a server. `[invoke]` beside `[agent]`
+makes one out of the other without the agent knowing:
+
+```toml
+[agent]
+image = "agent.wasm"
+secrets = ["MODEL_KEY@api.example.com"]
+
+[invoke]
+listen = "0.0.0.0:8080"
+open = true                # the platform in front authenticates
+```
+
+- **Each POST is one whole run.** The request body is the run's stdin; what
+  it writes to stdout is the response, as it is (`application/json` when it
+  is JSON). A run that does not end with 0 is a 500 whose body says why. The
+  agent's tools, checks and budgets are those of any run, counted afresh.
+- **Nothing is kept between requests.** A run starts from the file, so one
+  request cannot leave anything for the next. State that must last belongs
+  in a mount or behind a tool.
+- **Any path.** The platform chooses it (`/invocations` on AgentCore); the
+  workload is not told.
+- **`GET /ping` is nautra's**, on this server and on `[mcp]`'s: it answers
+  `{"status": "Healthy"}` without a token and without running anything. It
+  says the process is up, which is what a platform's health check asks.
+- **Who may call** is said the same way as for `[mcp]`, and for the same
+  reason.
+- **No record**, as for any published service.
+
+An agent written to read its task from stdin when it has no arguments runs
+the same from a shell, as a tool of another agent, and behind `[invoke]`.
+
+The body is not interpreted. A platform's own envelope (`{"prompt": …}`) is
+the agent's to read, as its payload always was.
+
+## 4. What the platforms ask for
 
 | | architecture | shape | where the request arrives |
 |---|---|---|---|
-| Amazon Bedrock AgentCore Runtime | linux/arm64 | whole agent | `POST /invocations` and `GET /ping` on 8080; or MCP on 8000 |
+| Amazon Bedrock AgentCore Runtime | linux/arm64 | whole agent (`[invoke]`), or tools (`[mcp]`) | `POST /invocations` and `GET /ping` on 8080; or `POST /mcp` on 8000 |
 | Cloudflare Containers, Sandbox SDK | linux/amd64 | whole agent, or tools | whatever port the Worker in front forwards to |
 | Cloudflare Agents SDK, other frameworks | — | tools | MCP over HTTP |
 
@@ -86,10 +128,11 @@ Wasm still works.
 
 ## Not decided yet
 
-- **The request shape of a platform.** AgentCore's HTTP contract wants two
-  paths the agent would otherwise have to implement itself. Whether nautra
-  answers `/ping` and hands the body of `/invocations` to the workload, so an
-  agent need not be written for one platform, is the next decision.
+- **Streaming.** A response is the whole of what a run wrote. A platform
+  that takes server-sent events gets none.
+- **Sessions.** A platform that names a session with a header
+  (`X-Amzn-Bedrock-AgentCore-Runtime-Session-Id`) is not listened to: every
+  request is a fresh run.
 - **Signed model requests.** A secret here is a value put on a request for
   the hosts it is bound to. A model endpoint that wants each request signed
   (AWS SigV4) does not fit that; either an API key is used or the host signs.

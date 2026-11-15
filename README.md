@@ -268,6 +268,35 @@ env = ["MCP_URL=https://mcp.example.com/mcp", "MCP_TOOL=search"]
 secrets = ["MCP_TOKEN@mcp.example.com"]
 ```
 
+### Publishing an agent
+
+An agent is a workload that ends. A platform that hosts agents wants a
+server. `[invoke]` beside `[agent]` publishes the agent without changing it:
+each POST is one whole run, the request body on its stdin and what it writes
+as the response.
+
+```toml
+[agent]
+image = "agent.wasm"
+secrets = ["MODEL_KEY@api.example.com"]
+
+[invoke]
+listen = "8080"            # PORT (this machine) or ADDRESS:PORT
+token = "DOOR_TOKEN"       # or open = true, behind a platform that authenticates
+```
+
+```console
+$ nautra run -f nautra.toml
+nautra: each POST runs the workload: http://127.0.0.1:8080/invocations
+$ curl -H "Authorization: Bearer $DOOR_TOKEN" -d '{"prompt": "What does the note say?"}' localhost:8080/invocations
+The note says: THE TIDE IS IN
+```
+
+Nothing is kept between requests, any path is taken, and `GET /ping` answers
+`{"status": "Healthy"}`. This is the shape Amazon Bedrock AgentCore Runtime
+asks of a container; [examples/platforms](examples/platforms/) has what goes
+in one. See [ADR-0003](docs/adr/0003-platforms.md).
+
 ### Publishing tools to an agent that runs elsewhere
 
 An agent does not have to be Wasm, or run under nautra, to use these tools. A

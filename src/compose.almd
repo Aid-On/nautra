@@ -47,6 +47,10 @@ type Composition = {
   tools: List[Tool],
   checks: List[Check],
   max_tool_calls: Int,
+  // With `[invoke]`: where the workload is published, run once for each
+  // request, and the host variable holding the callers' token. "" for none.
+  invoke: String,
+  invoke_token: String,
 }
 
 local let GRANT_KEYS = ["mounts", "net", "env", "secrets", "timeout", "memory", "fuel"]
@@ -208,21 +212,28 @@ fn publishes(doc: Value) -> Bool = option.is_some(value.get(doc, "mcp"))
 local fn is_loopback(address: String) -> Bool =
   string.starts_with(address, "127.") or string.starts_with(address, "[::1]:") or string.starts_with(address, "localhost:")
 
+// Where a table listens and who may call: its address, and the name of the
+// host variable holding the callers' bearer token ("" for none). Whoever
+// reaches the address can call, so beyond this machine that is never left
+// unsaid.
+local fn door(table: Value, where: String) -> (String, String)! = {
+  let listen = grants.parse_publish(text(table, "listen", where)! |> option.to_result("${where} needs listen = \"PORT\" or \"ADDRESS:PORT\"")!) |> result.map_err((e) => "${where} listen: ${e}")!
+  let token = text(table, "token", where)! ?? ""
+  let open = match value.get(table, "open") {
+    some(v) => value.as_bool(v) |> result.map_err((_) => "${where} open must be true or false")!,
+    none => false,
+  }
+  guard not (open and token != "") else err("${where} says both `open = true` and a token; it is one or the other")
+  guard token != "" or open or is_loopback(listen) else err("${where} listens on ${listen}, beyond this machine, and does not say who may call: name a host variable holding a bearer token (`token = \"NAME\"`), or write `open = true` where something in front of nautra decides that")
+  (listen, token)
+}
+
 fn parse_published(doc: Value, base: String) -> Published! = {
   guard option.is_none(value.get(doc, "agent")) else err("nautra.toml has both [agent] and [mcp]: a file runs an agent with its tools, or publishes the tools, not both")
   only_keys(doc, ["mcp", "tools", "checks"], "nautra.toml")!
   let table = value.get(doc, "mcp") |> option.to_result("nautra.toml needs an [mcp] table")!
   only_keys(table, ["listen", "token", "open", "audit"], "[mcp]")!
-  let listen = grants.parse_publish(text(table, "listen", "[mcp]")! |> option.to_result("[mcp] needs listen = \"PORT\" or \"ADDRESS:PORT\"")!) |> result.map_err((e) => "[mcp] listen: ${e}")!
-  let token = text(table, "token", "[mcp]")! ?? ""
-  let open = match value.get(table, "open") {
-    some(v) => value.as_bool(v) |> result.map_err((_) => "[mcp] open must be true or false")!,
-    none => false,
-  }
-  guard not (open and token != "") else err("[mcp] says both `open = true` and a token; it is one or the other")
-  // Whoever reaches the address can call the tools. Beyond this machine that
-  // is never left unsaid.
-  guard token != "" or open or is_loopback(listen) else err("[mcp] listens on ${listen}, beyond this machine, and does not say who may call: name a host variable holding a bearer token (`token = \"MCP_TOKEN\"`), or write `open = true` where something in front of nautra decides that")
+  let (listen, token) = door(table, "[mcp]")!
   let tools = entries(doc, "tools")! |> list.map(((name, table)) => tool(name, table, base)!)!
   guard not list.is_empty(tools) else err("[mcp] publishes the file's tools, and it has none")
   let checks = entries(doc, "checks")! |> list.map(((name, table)) => check(name, table, base)!)!
@@ -244,7 +255,7 @@ fn parse_published(doc: Value, base: String) -> Published! = {
 // Reads a parsed composition file. `base` is the directory the file is in.
 fn parse(doc: Value, base: String) -> Composition! = {
   guard not publishes(doc) else err("this file publishes its tools ([mcp]) and has no agent to run; give it to `nautra run -f` on its own")
-  only_keys(doc, ["agent", "tools", "checks"], "nautra.toml")!
+  only_keys(doc, ["agent", "tools", "checks", "invoke"], "nautra.toml")!
   let agent = value.get(doc, "agent") |> option.to_result("nautra.toml needs an [agent] table")!
   only_keys(agent, ["image", "args", "publish", "audit", "max_tool_calls"] + GRANT_KEYS, "[agent]")!
   let image = text(agent, "image", "[agent]")! |> option.to_result("[agent] needs an image")!
@@ -257,6 +268,15 @@ fn parse(doc: Value, base: String) -> Composition! = {
       guard named == "*" or list.any(tools, (t) => t.name == named) else err("[checks.${c.name}] is set before '${named}', which is not one of the tools")
     }
   }
+  // [invoke] publishes a workload that ends: each request is one run of it.
+  let (invoke, invoke_token) = match value.get(doc, "invoke") {
+    some(table) => {
+      only_keys(table, ["listen", "token", "open"], "[invoke]")!
+      guard list.is_empty(publish) else err("[agent] publish is for an HTTP service, which answers requests itself; [invoke] runs a workload that ends once for each request. A file has one or the other")
+      door(table, "[invoke]")!
+    },
+    none => ("", ""),
+  }
   Composition {
     image: image_at(base, image),
     options: grant_options(agent, base, "[agent]")! + publish + audit,
@@ -264,6 +284,8 @@ fn parse(doc: Value, base: String) -> Composition! = {
     tools: tools,
     checks: checks,
     max_tool_calls: count(agent, "max_tool_calls", "[agent]")!,
+    invoke: invoke,
+    invoke_token: invoke_token,
   }
 }
 
@@ -455,4 +477,20 @@ test "tools are not published beyond this machine without a word on who may call
   let finish = [("checks", value.object([("c", value.object([("image", value.string("c.wasm")), ("finish", value.bool(true))]))]))]
   assert(result.is_err(parse_published(published_doc([("listen", value.string("8000"))], finish), "/p")))
   assert(result.is_err(parse(published_doc([("listen", value.string("8000"))], []), "/p")))
+}
+
+test "[invoke] publishes a workload that ends, with the same word on who may call" {
+  let with = (invoke: List[(String, Value)], agent: List[(String, Value)]) => parse(value.object([
+    ("agent", value.object([("image", value.string("a.wasm"))] + agent)),
+    ("invoke", value.object(invoke)),
+  ]), "/p")
+  let c = with([("listen", value.string("8080"))], [])!
+  assert_eq(c.invoke, "127.0.0.1:8080")
+  assert_eq(c.invoke_token, "")
+  assert_eq(with([("listen", value.string("0.0.0.0:8080")), ("token", value.string("T"))], [])!.invoke_token, "T")
+  assert(result.is_ok(with([("listen", value.string("0.0.0.0:8080")), ("open", value.bool(true))], [])))
+  assert(result.is_err(with([("listen", value.string("0.0.0.0:8080"))], [])))
+  assert(result.is_err(with([], [])))
+  assert(result.is_err(with([("listen", value.string("8080"))], [("publish", value.string("9090"))])))
+  assert_eq(parse(sample(), "/p")!.invoke, "")
 }

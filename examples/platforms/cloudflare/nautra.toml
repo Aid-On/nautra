@@ -1,0 +1,21 @@
+# Tools published as an MCP server, for an agent that runs elsewhere.
+#
+# MCP_TOKEN is given to the container as an environment variable, and the
+# Worker in front sends it as `Authorization: Bearer …`. The container is not
+# reachable from the internet except through that Worker, and the token keeps
+# it that way if that ever stops being true.
+
+[mcp]
+listen = "0.0.0.0:8000"
+token = "MCP_TOKEN"
+
+[tools.read_file]
+image = "read_file.wasm"
+description = "Read a text file from the workspace. `path` is relative to the workspace."
+input = { type = "object", properties = { path = { type = "string" } }, required = ["path"], additionalProperties = false }
+mounts = ["workspace:/work:ro"]
+
+[tools.upper]
+image = "upper.wasm"
+description = "Return a text in capital letters."
+input = { type = "object", properties = { text = { type = "string" } }, required = ["text"], additionalProperties = false }

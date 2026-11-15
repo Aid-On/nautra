@@ -1,0 +1,29 @@
+# An agent published for Amazon Bedrock AgentCore Runtime: each request to
+# /invocations is one run of the agent, the request body on its stdin.
+#
+# MODEL_KEY is given to the runtime as an environment variable; the agent
+# itself holds only a placeholder. The model is any OpenAI-compatible
+# chat-completions endpoint that takes a bearer token.
+
+[agent]
+image = "agent.wasm"
+env = ["MODEL_URL=https://api.example.com/v1/chat/completions", "MODEL_NAME=your-model"]
+secrets = ["MODEL_KEY@api.example.com"]
+timeout = "5m"
+max_tool_calls = 16
+
+[invoke]
+listen = "0.0.0.0:8080"
+# The runtime authenticates callers before a request reaches the container.
+open = true
+
+[tools.read_file]
+image = "read_file.wasm"
+description = "Read a text file from the workspace. `path` is relative to the workspace."
+input = { type = "object", properties = { path = { type = "string" } }, required = ["path"], additionalProperties = false }
+mounts = ["workspace:/work:ro"]
+
+[tools.upper]
+image = "upper.wasm"
+description = "Return a text in capital letters."
+input = { type = "object", properties = { text = { type = "string" } }, required = ["text"], additionalProperties = false }
