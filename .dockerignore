@@ -1,4 +1,9 @@
+# Only what an image is made from reaches the builder: the released binaries
+# (Dockerfile), and the examples with their built guests
+# (examples/platforms/*/Dockerfile).
 *
 !dist/image/
 !LICENSE
 !NOTICE
+!examples/
+!target/wasm/

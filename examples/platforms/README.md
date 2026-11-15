@@ -3,9 +3,11 @@
 What goes in a container for a platform that hosts agents. The reasoning is
 in [ADR-0003](../../docs/adr/0003-platforms.md).
 
-None of these has been deployed yet. What is tested, in this repository's
-integration suite, is nautra's side: that a file with `[invoke]` or `[mcp]`
-answers the requests each platform's documentation says it sends.
+None of these has been deployed yet. What is tested is nautra's side: the
+integration suite checks that a file with `[invoke]` or `[mcp]` answers the
+requests each platform's documentation says it sends, and
+`scripts/check-example-images.sh` builds these images and asks the running
+containers the same.
 
 | | image | file |
 |---|---|---|
