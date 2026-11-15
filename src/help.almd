@@ -8,6 +8,7 @@ fn usage() -> String = """
   Usage: nautra <command> [options]
 
     run [grants] IMAGE|FILE.wasm [args…]   run a workload with exactly what you grant it
+    run -f nautra.toml [args…]              run a workload with the tools its file gives it
     run -d [--name NAME] …                  the same, in the background; prints the run's id
     ps [-a]                                 list background runs (-a: ended ones too)
     logs [-f] RUN                           what a background run has written (-f: keep following)

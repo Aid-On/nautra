@@ -9,6 +9,7 @@ import json
 import path
 import process
 import random
+import self.compose
 import self.engine
 import self.grants
 import self.help
@@ -116,9 +117,10 @@ local effect fn bind_secrets(wanted: List[grants.SecretGrant]) -> List[engine.Bo
   bound
 }
 
-// One run on this process, to its end: what `run` does, and what the
-// process behind a background run does.
-local effect fn run_here(line: grants.RunLine) -> Int = {
+// Everything a run needs, decided: the request document the engine applies.
+// The workload is found (and pulled if need be), its grants are checked, and
+// its secrets are bound.
+local effect fn prepare(line: grants.RunLine) -> Value = {
   for mount in line.grants.mounts {
     guard fs.is_dir(mount.host) else err("cannot mount '${mount.host}': it is not a directory")!
   }
@@ -136,7 +138,41 @@ local effect fn run_here(line: grants.RunLine) -> Int = {
   // The guest holds each secret's placeholder under the secret's name.
   let env_pairs = (environment(target.config, line.grants.env)! |> list.filter(((name, _)) => not list.any(secrets, (s) => s.name == name)))
     + (secrets |> list.map((s) => (s.name, s.placeholder)))
-  let request = engine.request(target.path, argv, env_pairs, line.grants, secrets)
+  engine.request(target.path, argv, env_pairs, line.grants, secrets)
+}
+
+// One tool as the engine needs it: its name and schema for the workload to
+// see, and the whole request its image runs under each time it is called.
+// A tool's options are judged by the same parser as a `run` line's.
+local effect fn tool_entry(t: compose.Tool, audit: String) -> Value = {
+  let parsed = grants.parse_run(t.options + [t.image]) |> result.map_err((e) => "tool ${t.name}: ${e}")!
+  // What a tool does at its own boundary goes in the same record as the
+  // workload that called it.
+  let line = { ...parsed, grants: { ...parsed.grants, audit: audit } }
+  let request = prepare(line) |> result.map_err((e) => "tool ${t.name}: ${e}")!
+  value.object([
+    ("name", value.string(t.name)),
+    ("description", value.string(t.description)),
+    ("input", t.input),
+    ("max_calls", value.int(t.max_calls)),
+    ("request", request),
+  ])
+}
+
+// One run on this process, to its end: what `run` does, and what the
+// process behind a background run does.
+local effect fn run_here(line: grants.RunLine, composed: compose.Composition?) -> Int = {
+  let base = prepare(line)!
+  let request = match composed {
+    some(c) => {
+      var tools: List[Value] = []
+      for t in c.tools {
+        tools = tools + [tool_entry(t, line.grants.audit)!]
+      }
+      value.merge(base, value.object([("tools", value.array(tools)), ("max_tool_calls", value.int(c.max_tool_calls))]))
+    },
+    none => base,
+  }
   let outcome = engine.run(request)!
   if outcome.error != "" then {
     eprintln("nautra: ${outcome.error}")
@@ -157,8 +193,10 @@ local effect fn start_detached(args: List[String], line: grants.RunLine) -> Int 
   let name = if line.name != "" then line.name else if grants.is_run_name(derived) then derived else id
   guard not runs.is_name_taken(name)! else err("a run named '${name}' already exists: remove it with `nautra rm ${name}`, or pick another --name")!
   fs.mkdir_p(runs.dir(id)!)!
-  let options = list.take(args, list.len(args) - list.len(line.args) - 1)
-  let pid = engine.spawn_self(["run", "--run-id", id] + runs.child_options(options) + [line.image] + line.args, runs.log_path(id)!)!
+  // The background process is given the line as it was written — a
+  // composition file and all — less the options that ask for the background.
+  let options = grants.option_count(args)
+  let pid = engine.spawn_self(["run", "--run-id", id] + runs.child_options(list.take(args, options)) + list.drop(args, options), runs.log_path(id)!)!
   runs.save(runs.Run {
     id: id,
     name: name,
@@ -186,13 +224,14 @@ local effect fn start_detached(args: List[String], line: grants.RunLine) -> Int 
 }
 
 local effect fn cmd_run(args: List[String]) -> Int = {
-  let line = grants.parse_run(args)!
+  let (expanded, composed) = compose.expand(args)!
+  let line = grants.parse_run(expanded)!
   if line.detach then start_detached(args, line)!
-  else if line.run_id == "" then run_here(line)!
+  else if line.run_id == "" then run_here(line, composed)!
   else {
     // This process is a background run: it reports to its record.
     runs.await_record(line.run_id)!
-    let code = match run_here(line) {
+    let code = match run_here(line, composed) {
       ok(c) => c,
       err(message) => {
         eprintln("nautra: ${message}")

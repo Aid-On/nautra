@@ -173,6 +173,25 @@ local fn with_value(g: Grants, flag: String, text: String) -> Grants! = match fl
   _ => err("unknown option '${flag}'"),
 }
 
+// How many leading arguments of a `run` line are options, counting each
+// option's value with it. What follows is the image and the workload's own
+// arguments — or, with `-f`, only the latter.
+fn option_count(args: List[String]) -> Int = {
+  var i = 0
+  var more = true
+  while more and i < list.len(args) {
+    let arg = list.get(args, i) ?? ""
+    if not string.starts_with(arg, "-") then {
+      more = false
+    } else if not string.contains(arg, "=") and (takes_value(arg) or list.contains(["--name", "--run-id", "-f", "--file"], arg)) then {
+      i = i + 2
+    } else {
+      i = i + 1
+    }
+  }
+  int.min(i, list.len(args))
+}
+
 local fn takes_value(flag: String) -> Bool =
   list.contains(["-v", "--volume", "-e", "--env", "--allow-net", "-p", "--publish", "--secret", "--audit", "-m", "--memory", "--timeout", "--fuel"], flag)
 
@@ -317,4 +336,11 @@ test "a secret is bound to named hosts, on 443 unless said" {
   assert(result.is_err(parse_secret("@host")))
   assert(result.is_err(parse_secret("K@*")))
   assert_eq(list.len(parse_run(["--secret", "K@a.example", "--audit", "run.jsonl", "app"])!.grants.secrets), 1)
+}
+
+test "options are counted with their values" {
+  assert_eq(option_count(["-v", "a:/a", "-d", "--name=x", "app", "-v"]), 4)
+  assert_eq(option_count(["-f", "nautra.toml", "task"]), 2)
+  assert_eq(option_count(["app"]), 0)
+  assert_eq(option_count(["-d", "--name"]), 2)
 }

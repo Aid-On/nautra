@@ -17,6 +17,8 @@ use http::HeaderValue;
 use serde_json::{json, Value};
 use wasmtime_wasi_http::{Error, RequestOptions, WasiBody, WasiHttpHooks};
 
+use super::tools::{self, Tools};
+
 /// The record of what a run did at its boundary: one JSON object per line,
 /// appended. A line that cannot be written is dropped rather than failing
 /// the run it describes.
@@ -30,7 +32,7 @@ impl Audit {
         Ok(Some(Arc::new(Audit(Mutex::new(file)))))
     }
 
-    fn write(&self, mut record: Value) {
+    pub(super) fn record(&self, mut record: Value) {
         record["time"] = json!(now_utc());
         if let Ok(mut file) = self.0.lock() {
             let _ = writeln!(file, "{record}");
@@ -39,7 +41,7 @@ impl Audit {
 
     /// One socket use the guest attempted and how it was decided.
     pub(super) fn socket(&self, addr: &SocketAddr, usage: &str, admitted: bool) {
-        self.write(json!({
+        self.record(json!({
             "kind": "socket",
             "decision": if admitted { "allow" } else { "deny" },
             "use": usage,
@@ -102,6 +104,7 @@ pub(super) struct Outbound {
     rules: Vec<(String, Option<u16>)>,
     secrets: Vec<Secret>,
     audit: Option<Arc<Audit>>,
+    tools: Option<Arc<Tools>>,
 }
 
 /// What was decided about one request before it was sent.
@@ -111,7 +114,7 @@ struct Verdict {
 }
 
 impl Outbound {
-    pub(super) fn of(request: &Value, audit: Option<Arc<Audit>>) -> Outbound {
+    pub(super) fn of(request: &Value, audit: Option<Arc<Audit>>, tools: Option<Arc<Tools>>) -> Outbound {
         let net = &request["net"];
         let rules = match net["mode"].as_str().unwrap_or("none") {
             "all" => vec![("*".to_owned(), None)],
@@ -134,7 +137,7 @@ impl Outbound {
         for secret in &secrets {
             rules.extend(secret.hosts.iter().map(|(host, port)| (host.clone(), Some(*port))));
         }
-        Outbound { rules, secrets, audit }
+        Outbound { rules, secrets, audit, tools }
     }
 
     fn admits(&self, host: &str, port: u16) -> bool {
@@ -206,6 +209,22 @@ fn substitute(haystack: &[u8], needle: &[u8], with: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// A request to the tools endpoint: answered here, never sent anywhere. A
+/// guest that was given no tools is refused, as for any ungranted host.
+async fn answer_locally(tools: Option<Arc<Tools>>, request: http::Request<WasiBody>) -> Sent {
+    use http_body_util::BodyExt;
+    let Some(tools) = tools else { return Err(Error::HttpRequestDenied) };
+    let body = request.into_body().collect().await?.to_bytes();
+    if body.len() > tools::MAX_BYTES {
+        return Err(Error::HttpRequestDenied);
+    }
+    let answer = tools.answer(&body).await;
+    let mut response = http::Response::new(http_body_util::Full::new(hyper::body::Bytes::from(answer.body)).map_err(|never| match never {}).boxed_unsync());
+    *response.status_mut() = http::StatusCode::from_u16(answer.status).unwrap_or(http::StatusCode::OK);
+    response.headers_mut().insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok((response, Box::new(async { Ok(()) }) as Box<dyn Future<Output = _> + Send>))
+}
+
 type Sent = Result<(http::Response<WasiBody>, Box<dyn Future<Output = Result<(), Error>> + Send>), Error>;
 
 impl WasiHttpHooks for Outbound {
@@ -218,6 +237,9 @@ impl WasiHttpHooks for Outbound {
         let secure = request.uri().scheme_str() == Some("https");
         let port = request.uri().port_u16().unwrap_or(if secure { 443 } else { 80 });
         let host = request.uri().host().unwrap_or("").trim_start_matches('[').trim_end_matches(']').to_owned();
+        if host.eq_ignore_ascii_case(tools::HOST) {
+            return Box::new(answer_locally(self.tools.clone(), request));
+        }
         let verdict = self.decide(&mut request, &host, port, secure);
         // The record names where a request went and what it carried, never
         // the query string or a header value.
@@ -237,7 +259,7 @@ impl WasiHttpHooks for Outbound {
             if let Some(reason) = verdict.refusal {
                 record["reason"] = json!(reason);
                 if let Some(audit) = &audit {
-                    audit.write(record);
+                    audit.record(record);
                 }
                 return Err(Error::HttpRequestDenied);
             }
@@ -247,7 +269,7 @@ impl WasiHttpHooks for Outbound {
                 Err(error) => record["error"] = json!(error.to_string()),
             }
             if let Some(audit) = &audit {
-                audit.write(record);
+                audit.record(record);
             }
             let (response, io) = sent?;
             Ok((response.map(BodyExt::boxed_unsync), Box::new(io) as Box<dyn Future<Output = _> + Send>))

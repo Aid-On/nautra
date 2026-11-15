@@ -17,6 +17,7 @@
   <a href="#quick-start">Quick start</a> ·
   <a href="#grants">Grants</a> ·
   <a href="#services">Services</a> ·
+  <a href="#agents-and-tools">Agents</a> ·
   <a href="#background-runs">Background</a> ·
   <a href="#images">Images</a> ·
   <a href="#registries">Registries</a> ·
@@ -155,6 +156,63 @@ to accept connections from elsewhere. Requests are handled side by side,
 `--timeout` is a deadline per request, and the service is given the same
 grants as any run: nothing by default. It stops on Ctrl-C or SIGTERM.
 
+## Agents and tools
+
+An agent here is an ordinary component whose every dealing with the world is
+an HTTP request, and nautra decides what each URL means. A model is a granted
+host with a bound secret. Tools are one [MCP](https://modelcontextprotocol.io)
+server at `http://tools.nautra/` — a name that never leaves nautra — and each
+tool behind it is another image, started fresh for every call with grants of
+its own.
+
+Which tools a workload has is written in a file:
+
+```toml
+# nautra.toml
+[agent]
+image = "ghcr.io/you/agent:v1"
+env = ["MODEL_URL=https://api.example.com/v1/chat/completions"]
+secrets = ["MODEL_KEY@api.example.com"]     # the agent holds a placeholder
+timeout = "2m"
+max_tool_calls = 16
+
+[tools.read_file]
+image = "ghcr.io/you/fs-tools@sha256:…"     # pinned by naming its digest
+description = "Read a file from the workspace."
+input = { type = "object", properties = { path = { type = "string" } }, required = ["path"] }
+mounts = ["./workspace:/work:ro"]           # this tool's, not the agent's
+
+[tools.upper]
+image = "upper:v1"                           # no grants: it can only compute
+```
+
+```text
+$ nautra run -f nautra.toml "What does the note say?"
+The note says: THE TIDE IS IN
+```
+
+The file says nothing a `run` line could not: each entry's `mounts`, `net`,
+`env`, `secrets`, `timeout`, `memory` and `fuel` are the options of the same
+names, read by the same parser. Paths in it are relative to the file. Options
+on the command line add to the `[agent]` entry.
+
+A tool is any command image: it gets the call's arguments as JSON on stdin
+and its stdout is the result, so it can be tried by hand.
+
+```text
+$ echo '{"text": "tide"}' | nautra run -i upper:v1
+TIDE
+```
+
+Arguments are checked against `input` on the host before the tool is started,
+and a refusal says what was wrong, so a model can correct the call. `max_calls`
+on a tool and `max_tool_calls` on the agent are ceilings; past them a call
+returns an error result and nothing runs. With `--audit`, every tool call is
+recorded beside the network decisions, the tools' own included.
+
+[`examples/agent`](examples/agent) is a complete agent in Almide, about a
+hundred lines, with two tools.
+
 ## Background runs
 
 `-d` starts a run in the background and prints its id. There is no daemon
@@ -271,8 +329,10 @@ on macOS and, in CI, on Linux. WASI 0.3 and its `wasi:http` are still marked
 experimental in wasmtime, and services inherit that. Push and pull are tested against a local
 `registry:2`, and have not yet been verified against public registries.
 
-Next is running agents: tools as images, a composition file, and a record a
-run can be replayed from ([ADR-0002](docs/adr/0002-agents.md)).
+Agents are being built in the order [ADR-0002](docs/adr/0002-agents.md)
+gives. Secrets, the record of decisions, and tools are in; replaying a run
+from a record, checks before a tool call and before finishing, delegation to
+other agents, remote MCP servers, and confining native commands are not.
 
 Not there yet:
 

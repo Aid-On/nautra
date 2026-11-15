@@ -1,7 +1,7 @@
 # ADR-0002: Agents
 
-Status: accepted (2026-11-15). Implemented so far: §2 (secrets) and the
-network part of §5 (the record).
+Status: accepted (2026-11-15). Implemented so far: §2 (secrets), §3 (tools),
+§4 for one workload and its tools, and §5's `--audit`.
 
 Nautra is to be an environment agents run in, and to do everything
 [Porta](https://github.com/almide/porta) does. Porta grew its agent runtime
@@ -52,13 +52,26 @@ instance per call with exactly the grants its entry names — usually none. The
 agent sees tools as one MCP server at a reserved local name. Arguments are
 validated against the schema on the host, before the tool is started.
 
+A tool is a command image: the call's arguments arrive as JSON on its stdin,
+and what it writes to stdout is the result; a non-zero exit makes the result
+an error carrying its stderr. That is the whole contract, so a tool can be
+written in anything and tried from a shell. The reserved name is
+`tools.nautra`; a request to it is answered inside nautra and never sent.
+
+A failed or refused call comes back as an error *result*, not a protocol
+error, and says what was wrong — the schema violations, the exhausted budget
+— so that a model reading it can correct itself.
+
 Because a tool is an image, pinning it is naming it by digest; no separate
 pinning mechanism is needed.
 
 ## 4. One composition file
 
 Which tools an agent has, each one's grants, and the budgets (calls per
-destination, per tool, in total) are declared in one file. The same format
+tool, and in total) are declared in one file, `nautra.toml`, given to
+`run -f`. An entry's grants are spelled as the `run` options of the same
+names and are read by the same parser, so the file is another way to write a
+`run` line, not a second policy language. The same format
 describes several services that run together: an entry is an image, its
 grants, and the name others reach it by. Checks that must pass before a tool
 call or before the agent may finish are images too, named in the same file.
@@ -103,7 +116,7 @@ written for them is ported by making it speak MCP over HTTP.
 ## Order
 
 1. Secrets and the network record. *(done)*
-2. Tools as images, the composition file, and a sample agent in Almide.
+2. Tools as images, the composition file, and a sample agent in Almide. *(done)*
 3. `--record`, `replay`, resume.
 4. Checks, delegation, remote MCP.
 5. `exec`.

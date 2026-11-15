@@ -18,10 +18,12 @@ that work is done in.
 | `src/store.almd` | the local store, an OCI image layout |
 | `src/image.almd` | Nautrafile, building an image, what an image asks for |
 | `src/registry.almd` | OCI Distribution: pull, push, authentication |
+| `src/compose.almd` | `nautra.toml`: a workload and its tools, read into `run` options |
 | `src/runs.almd` | background runs: the record, the log, stop and remove |
 | `src/engine.almd` | every `@extern` into the native side |
 | `native/engine.rs` | one run applied to wasmtime; the guest's view of the host, built from the request |
 | `native/engine/outbound.rs` | outbound `wasi:http`: destinations, secrets, the audit record |
+| `native/engine/tools.rs` | the MCP endpoint at `tools.nautra`; a tool call is a captured run |
 | `native/engine/serve.rs` | an HTTP component served on a published address (`-p`) |
 | `native/engine/spawn.rs` | `run -d`: nautra started once more with no terminal |
 | `native/engine/inspect.rs` | what a `.wasm` file is, without compiling it |
@@ -61,7 +63,9 @@ NAUTRA_TEST_REGISTRY=localhost:5057 python3 scripts/integration.py target/nautra
 - A name without a registry is never sent anywhere.
 - A secret's real value exists only in the host process: the guest holds a
   placeholder, and no record, log or run file holds the value.
-- Policy stays in Almide. The native side applies a finished request.
+- Policy stays in Almide. The native side applies a finished request. A
+  tool's whole run request is prepared before the workload starts; the
+  engine only looks it up by name when the tool is called.
 - Every source file carries the SPDX header of its directory: `Apache-2.0`
   outside `ee/`, `LicenseRef-Nautra-Enterprise` inside.
 

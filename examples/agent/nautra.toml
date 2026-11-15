@@ -1,0 +1,25 @@
+# An agent and the tools it may call. From the repository root:
+#
+#   bash scripts/build-examples.sh
+#   export MODEL_KEY=…          # the agent itself never sees this value
+#   nautra run -f examples/agent/nautra.toml "What does notes/tide.txt say, in capitals?"
+#
+# The model is any OpenAI-compatible chat-completions endpoint.
+
+[agent]
+image = "../../target/wasm/agent.wasm"
+env = ["MODEL_URL=https://api.example.com/v1/chat/completions", "MODEL_NAME=your-model"]
+secrets = ["MODEL_KEY@api.example.com"]
+timeout = "2m"
+max_tool_calls = 16
+
+[tools.read_file]
+image = "../../target/wasm/read_file.wasm"
+description = "Read a text file from the workspace. `path` is relative to the workspace."
+input = { type = "object", properties = { path = { type = "string" } }, required = ["path"], additionalProperties = false }
+mounts = ["workspace:/work:ro"]
+
+[tools.upper]
+image = "../../target/wasm/upper.wasm"
+description = "Return a text in capital letters."
+input = { type = "object", properties = { text = { type = "string" } }, required = ["text"], additionalProperties = false }

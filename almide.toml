@@ -14,8 +14,9 @@ allow = ["FS.read", "FS.write", "IO", "Env", "Time", "Net", "Proc", "Rand", "Fan
 # a background run to stop it.
 proc = ["ps", "kill"]
 
-# The only native code is the engine: wasmtime, and the two parsers it needs
-# (the wasm binary format for `inspect`, TOML for the Nautrafile). ureq is a
+# The only native code is the engine: wasmtime, the two parsers it needs (the
+# wasm binary format for `inspect`, TOML for the Nautrafile), and JSON Schema
+# for checking a tool call's arguments. ureq is a
 # stopgap for sending a binary request body, which Almide 0.70's http client
 # cannot do yet; see native/engine/upload.rs.
 [native-deps]
@@ -29,5 +30,6 @@ http = "1"
 tokio = { version = "1", features = ["net", "signal", "time", "rt", "macros"] }
 wasmparser = "0.258.3"
 serde_json = "1"
+jsonschema = { version = "=0.56.0", default-features = false }
 toml = "0.8"
 ureq = { version = "2.12", default-features = false, features = ["tls"] }

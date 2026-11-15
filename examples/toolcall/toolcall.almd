@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: Apache-2.0
+// Calls one tool over MCP, with no model involved: `toolcall NAME JSON`.
+// With no arguments it lists the tools it was given.
+//
+// Tools are one MCP server at http://tools.nautra/ — a name that never
+// leaves nautra.
+import env
+import http
+import json
+
+effect fn rpc(method: String, params: Value) -> Value = {
+  let message = value.object([
+    ("jsonrpc", value.string("2.0")),
+    ("id", value.int(1)),
+    ("method", value.string(method)),
+    ("params", params),
+  ])
+  let resp = http.send(http.new_request("POST", "http://tools.nautra/", json.stringify(message), [("Content-Type", "application/json")]))!
+  let reply = json.parse(http.body(resp))!
+  match value.get(reply, "error") {
+    some(problem) => err(value.get_string(problem, "message") ?? "the tool endpoint refused the request")!,
+    none => value.get(reply, "result") ?? value.null(),
+  }
+}
+
+effect fn main() -> Unit = {
+  let args = env.args()
+  match list.get(args, 0) {
+    none => {
+      let listed = rpc("tools/list", value.object([]))!
+      for tool in value.get_array(listed, "tools") ?? [] {
+        println("${value.get_string(tool, "name") ?? ""}: ${value.get_string(tool, "description") ?? ""}")
+      }
+    },
+    some(name) => {
+      let arguments = json.parse(list.get(args, 1) ?? "{}")!
+      let result = rpc("tools/call", value.object([("name", value.string(name)), ("arguments", arguments)]))!
+      let said = (value.get_array(result, "content") ?? []) |> list.filter_map((part) => value.get_string(part, "text")) |> list.join("\n")
+      println(if value.get_bool(result, "isError") ?? false then "tool error: ${said}" else said)
+    },
+  }
+}

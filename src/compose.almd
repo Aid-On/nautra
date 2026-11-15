@@ -1,0 +1,219 @@
+// SPDX-License-Identifier: Apache-2.0
+// The composition file (`nautra.toml`): one workload, and the tools it may
+// call. See docs/adr/0002-agents.md.
+//
+// The file says nothing `run` could not say on its command line. Each entry
+// is read into the same options `run` takes, so there is one grammar for
+// grants and one parser that judges them.
+
+import fs
+import path
+import self.engine
+import self.grants
+
+// A tool: an image started fresh for each call, with its own options.
+type Tool = {
+  name: String,
+  image: String,
+  options: List[String],
+  description: String,
+  input: Value,
+  max_calls: Int,
+}
+
+type Composition = {
+  image: String,
+  options: List[String],
+  args: List[String],
+  tools: List[Tool],
+  max_tool_calls: Int,
+}
+
+local let GRANT_KEYS = ["mounts", "net", "env", "secrets", "timeout", "memory", "fuel"]
+
+local fn only_keys(table: Value, allowed: List[String], where: String) -> Unit! = {
+  let keys = (value.as_object(table) |> result.map_err((_) => "${where} must be a table")!) |> list.map(((k, _)) => k)
+  match keys |> list.find((k) => not list.contains(allowed, k)) {
+    some(k) => err("unknown key '${k}' in ${where}; expected one of: ${list.join(allowed, ", ")}"),
+    none => (),
+  }
+}
+
+local fn strings(table: Value, key: String, where: String) -> List[String]! = match value.get(table, key) {
+  none => [],
+  some(v) => {
+    let items = value.as_array(v) |> result.map_err((_) => "${where} ${key} must be a list of strings")!
+    items |> list.map((item) => value.as_string(item) |> result.map_err((_) => "${where} ${key} must be a list of strings")!)!
+  },
+}
+
+local fn text(table: Value, key: String, where: String) -> String?! = match value.get(table, key) {
+  none => none,
+  some(v) => some(value.as_string(v) |> result.map_err((_) => "${where} ${key} must be a string")!),
+}
+
+local fn count(table: Value, key: String, where: String) -> Int! = match value.get(table, key) {
+  none => 0,
+  some(v) => {
+    let n = value.as_int(v) |> result.map_err((_) => "${where} ${key} must be a whole number")!
+    guard n > 0 else err("${where} ${key} must be greater than zero")
+    n
+  },
+}
+
+// A path in the file is relative to the file, not to where nautra was run.
+local fn beside(base: String, p: String) -> String = if path.is_absolute(p) then p else path.join(base, p)
+
+// An image that is written as a path is a .wasm file beside the file.
+local fn image_at(base: String, image: String) -> String =
+  if string.ends_with(image, ".wasm") or string.starts_with(image, "./") or string.starts_with(image, "../") or string.starts_with(image, "/") then beside(base, image)
+  else image
+
+local fn mount_at(base: String, mount: String) -> String = match string.split_once(mount, ":") {
+  some((host, rest)) => "${beside(base, host)}:${rest}",
+  none => mount,
+}
+
+// The grants of one entry, as the options `run` would be given.
+local fn grant_options(table: Value, base: String, where: String) -> List[String]! = {
+  let mounts = strings(table, "mounts", where)! |> list.flat_map((m) => ["-v", mount_at(base, m)])
+  let net = strings(table, "net", where)! |> list.flat_map((n) => ["--allow-net", n])
+  let env = strings(table, "env", where)! |> list.flat_map((e) => ["-e", e])
+  let secrets = strings(table, "secrets", where)! |> list.flat_map((s) => ["--secret", s])
+  let timeout = option.to_list(text(table, "timeout", where)!) |> list.flat_map((t) => ["--timeout", t])
+  let memory = option.to_list(text(table, "memory", where)!) |> list.flat_map((m) => ["-m", m])
+  let fuel = count(table, "fuel", where)!
+  mounts + net + env + secrets + timeout + memory + (if fuel > 0 then ["--fuel", int.to_string(fuel)] else [])
+}
+
+local fn is_tool_name(name: String) -> Bool =
+  name != "" and string.len(name) <= 64 and string.to_list(name) |> list.all((c) => (string.is_alphanumeric(c) and string.byte_len(c) == 1) or c == "_" or c == "-")
+
+local fn tool(name: String, table: Value, base: String) -> Tool! = {
+  let where = "[tools.${name}]"
+  guard is_tool_name(name) else err("'${name}' is not a tool name: use letters, digits, '_' and '-'")
+  only_keys(table, ["image", "description", "input", "max_calls"] + GRANT_KEYS, where)!
+  let image = text(table, "image", where)! |> option.to_result("${where} needs an image")!
+  let input = value.get(table, "input") ?? value.object([("type", value.string("object"))])
+  guard result.is_ok(value.as_object(input)) else err("${where} input must be a JSON Schema object")
+  Tool {
+    name: name,
+    image: image_at(base, image),
+    options: grant_options(table, base, where)!,
+    description: text(table, "description", where)! ?? "",
+    input: input,
+    max_calls: count(table, "max_calls", where)!,
+  }
+}
+
+// Reads a parsed composition file. `base` is the directory the file is in.
+fn parse(doc: Value, base: String) -> Composition! = {
+  only_keys(doc, ["agent", "tools"], "nautra.toml")!
+  let agent = value.get(doc, "agent") |> option.to_result("nautra.toml needs an [agent] table")!
+  only_keys(agent, ["image", "args", "publish", "audit", "max_tool_calls"] + GRANT_KEYS, "[agent]")!
+  let image = text(agent, "image", "[agent]")! |> option.to_result("[agent] needs an image")!
+  let publish = option.to_list(text(agent, "publish", "[agent]")!) |> list.flat_map((p) => ["-p", p])
+  let audit = option.to_list(text(agent, "audit", "[agent]")!) |> list.flat_map((a) => ["--audit", beside(base, a)])
+  let entries = match value.get(doc, "tools") {
+    some(table) => value.as_object(table) |> result.map_err((_) => "[tools] must be a table of tools")!,
+    none => [],
+  }
+  Composition {
+    image: image_at(base, image),
+    options: grant_options(agent, base, "[agent]")! + publish + audit,
+    args: strings(agent, "args", "[agent]")!,
+    tools: entries |> list.map(((name, table)) => tool(name, table, base)!)!,
+    max_tool_calls: count(agent, "max_tool_calls", "[agent]")!,
+  }
+}
+
+// A `run` line with `-f FILE` taken out: the file, the other options, and
+// the workload's own arguments. The file is "" when there was no `-f`.
+fn split_file(args: List[String]) -> (String, List[String], List[String]) = {
+  let n = grants.option_count(args)
+  var file = ""
+  var options: List[String] = []
+  var take_file = false
+  for arg in list.take(args, n) {
+    if take_file then {
+      file = arg
+      take_file = false
+    } else if arg == "-f" or arg == "--file" then {
+      take_file = true
+    } else if string.starts_with(arg, "--file=") then {
+      file = string.drop(arg, 7)
+    } else {
+      options = options + [arg]
+    }
+  }
+  (file, options, list.drop(args, n))
+}
+
+// Turns a `run` line that names a composition file into the line it stands
+// for, and returns the composition beside it. Options on the command line
+// come after the file's, so they add to it.
+effect fn expand(args: List[String]) -> (List[String], Composition?) = {
+  let (file, options, rest) = split_file(args)
+  if file == "" then (args, none) else {
+    let source = fs.read_text(file) |> result.map_err((e) => "cannot read ${file}: ${e}")!
+    let doc = engine.toml(source) |> result.map_err((e) => "${file}: ${e}")!
+    let c = parse(doc, path.dirname(file)) |> result.map_err((e) => "${file}: ${e}")!
+    (c.options + options + [c.image] + (if list.is_empty(rest) then c.args else rest), some(c))
+  }
+}
+
+local fn sample() -> Value = value.object([
+  ("agent", value.object([
+    ("image", value.string("agent.wasm")),
+    ("secrets", value.array([value.string("MODEL_KEY@api.example.com")])),
+    ("mounts", value.array([value.string("ws:/work:ro")])),
+    ("timeout", value.string("2m")),
+    ("max_tool_calls", value.int(8)),
+  ])),
+  ("tools", value.object([
+    ("calc", value.object([("image", value.string("ghcr.io/you/calc:v1")), ("max_calls", value.int(3))])),
+    ("read_file", value.object([
+      ("image", value.string("./tools/read.wasm")),
+      ("description", value.string("Read a file.")),
+      ("mounts", value.array([value.string("./ws:/work:ro")])),
+    ])),
+  ])),
+])
+
+test "an entry becomes run options, with paths beside the file" {
+  let c = parse(sample(), "/proj")!
+  assert_eq(c.image, "/proj/agent.wasm")
+  assert_eq(c.options, ["-v", "/proj/ws:/work:ro", "--secret", "MODEL_KEY@api.example.com", "--timeout", "2m"])
+  assert_eq(c.max_tool_calls, 8)
+  let calc = list.find(c.tools, (t) => t.name == "calc") ?? panic("no calc")
+  assert_eq(calc.image, "ghcr.io/you/calc:v1")
+  assert_eq(calc.options, [])
+  assert_eq(calc.max_calls, 3)
+  let read = list.find(c.tools, (t) => t.name == "read_file") ?? panic("no read_file")
+  assert_eq(read.image, "/proj/./tools/read.wasm")
+  assert_eq(read.options, ["-v", "/proj/./ws:/work:ro"])
+  assert_eq(read.description, "Read a file.")
+}
+
+test "the options an entry becomes are ones run accepts" {
+  let c = parse(sample(), "/proj")!
+  let line = grants.parse_run(c.options + [c.image])!
+  assert_eq(list.len(line.grants.secrets), 1)
+  assert_eq(line.grants.timeout_ms, 120000)
+}
+
+test "mistakes in the file are refused" {
+  assert(result.is_err(parse(value.object([]), ".")))
+  assert(result.is_err(parse(value.object([("agent", value.object([("image", value.string("a")), ("mount", value.array([]))]))]), ".")))
+  assert(result.is_err(parse(value.object([("agent", value.object([("image", value.string("a"))])), ("tool", value.object([]))]), ".")))
+  let bad_name = value.object([("agent", value.object([("image", value.string("a"))])), ("tools", value.object([("a b", value.object([("image", value.string("t"))]))]))])
+  assert(result.is_err(parse(bad_name, ".")))
+  let no_image = value.object([("agent", value.object([("image", value.string("a"))])), ("tools", value.object([("t", value.object([]))]))])
+  assert(result.is_err(parse(no_image, ".")))
+}
+
+test "-f is taken out of a run line" {
+  assert_eq(split_file(["-f", "nautra.toml", "-d", "--name", "a", "hello", "-f"]), ("nautra.toml", ["-d", "--name", "a"], ["hello", "-f"]))
+  assert_eq(split_file(["--file=x.toml"]), ("x.toml", [], []))
+  assert_eq(split_file(["-v", "a:/a", "app", "x"]), ("", ["-v", "a:/a"], ["app", "x"]))
+}

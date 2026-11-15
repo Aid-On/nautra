@@ -1,0 +1,98 @@
+// SPDX-License-Identifier: Apache-2.0
+// A small agent: asks a model, runs the tools the model asks for, and
+// repeats until the model answers.
+//
+// Everything it does is an HTTP request. The model is an OpenAI-compatible
+// chat-completions endpoint named by MODEL_URL (with MODEL_NAME, and
+// MODEL_KEY as the bearer token — give it with --secret, so this program
+// holds only a placeholder). The tools are an MCP server at
+// http://tools.nautra/, which nautra answers itself.
+import env
+import http
+import json
+
+let TOOLS = "http://tools.nautra/"
+let MAX_TURNS = 16
+
+effect fn post(target: String, body: Value, headers: List[(String, String)]) -> Value = {
+  let resp = http.send(http.new_request("POST", target, json.stringify(body), [("Content-Type", "application/json")] + headers))!
+  guard http.status(resp) == 200 else err("${target} answered ${http.status(resp)}")!
+  json.parse(http.body(resp))!
+}
+
+effect fn mcp(method: String, params: Value) -> Value = {
+  let reply = post(TOOLS, value.object([
+    ("jsonrpc", value.string("2.0")),
+    ("id", value.int(1)),
+    ("method", value.string(method)),
+    ("params", params),
+  ]), [])!
+  match value.get(reply, "error") {
+    some(problem) => err(value.get_string(problem, "message") ?? "the tool endpoint refused the request")!,
+    none => value.get(reply, "result") ?? value.null(),
+  }
+}
+
+// The tools as the model is told about them.
+effect fn tool_definitions() -> List[Value] =
+  (value.get_array(mcp("tools/list", value.object([]))!, "tools") ?? []) |> list.map((tool) => value.object([
+    ("type", value.string("function")),
+    ("function", value.object([
+      ("name", value.string(value.get_string(tool, "name") ?? "")),
+      ("description", value.string(value.get_string(tool, "description") ?? "")),
+      ("parameters", value.get(tool, "inputSchema") ?? value.object([])),
+    ])),
+  ]))
+
+// Runs one tool call the model asked for and returns the message that
+// carries its result back.
+effect fn run_call(call: Value) -> Value = {
+  let function = value.get(call, "function") ?? value.object([])
+  let name = value.get_string(function, "name") ?? ""
+  let arguments = json.parse(value.get_string(function, "arguments") ?? "{}") ?? value.object([])
+  let result = mcp("tools/call", value.object([("name", value.string(name)), ("arguments", arguments)]))
+  let said = match result {
+    ok(r) => (value.get_array(r, "content") ?? []) |> list.filter_map((part) => value.get_string(part, "text")) |> list.join("\n"),
+    err(problem) => "error: ${problem}",
+  }
+  value.object([
+    ("role", value.string("tool")),
+    ("tool_call_id", value.string(value.get_string(call, "id") ?? "")),
+    ("content", value.string(said)),
+  ])
+}
+
+effect fn main() -> Unit = {
+  let task = list.join(env.args(), " ")
+  guard task != "" else err("give the agent a task")!
+  let endpoint = env.get("MODEL_URL") |> option.to_result("MODEL_URL is not set")!
+  let model = env.get("MODEL_NAME") ?? "default"
+  let key = match env.get("MODEL_KEY") {
+    some(token) => [("Authorization", "Bearer ${token}")],
+    none => [],
+  }
+  let tools = tool_definitions()!
+  var messages = [value.object([("role", value.string("user")), ("content", value.string(task))])]
+  var answer = ""
+  var turn = 0
+  while answer == "" and turn < MAX_TURNS {
+    turn = turn + 1
+    let reply = post(endpoint, value.object([
+      ("model", value.string(model)),
+      ("messages", value.array(messages)),
+      ("tools", value.array(tools)),
+    ]), key)!
+    let message = (value.get_array(reply, "choices") ?? []) |> list.first |> option.flat_map((choice) => value.get(choice, "message")) |> option.to_result("the model sent no message")!
+    let calls = value.get_array(message, "tool_calls") ?? []
+    if list.is_empty(calls) then {
+      answer = value.get_string(message, "content") ?? "(no answer)"
+    } else {
+      messages = messages + [message]
+      for call in calls {
+        messages = messages + [run_call(call)!]
+      }
+    }
+  }
+  guard answer != "" else err("no answer after ${MAX_TURNS} turns")!
+  println(answer)
+}

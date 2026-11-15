@@ -23,6 +23,7 @@ use wasmtime_wasi_http::handler::{
 use wasmtime_wasi_http::{WasiBody, WasiHttpCtxView, WasiHttpView};
 
 use super::outbound::Audit;
+use super::tools::Tools;
 use super::{engine_config, inspect, refused, wasi_builder, ComponentCtx, Limits};
 
 /// How often a guest that is computing yields to the host, so that a request
@@ -63,7 +64,8 @@ fn serve(request: Value) -> Result<Value, String> {
         });
     }
     let audit = Audit::of(&request)?;
-    let serving = Serving { engine, pre, request, limits, audit };
+    let tools = Tools::of(&request, audit.clone())?;
+    let serving = Serving { engine, pre, request, limits, audit, tools };
     wasmtime_wasi::runtime::in_tokio(listen_and_serve(address, serving))?;
     Ok(json!({ "exit_code": 0 }))
 }
@@ -99,6 +101,7 @@ struct Serving {
     request: Value,
     limits: Limits,
     audit: Option<Arc<Audit>>,
+    tools: Option<Arc<Tools>>,
 }
 
 fn http_view(ctx: &mut ComponentCtx) -> WasiHttpCtxView<'_> {
@@ -112,8 +115,8 @@ impl HandlerState for Serving {
 
     fn instantiate(&self) -> impl Future<Output = wasmtime::Result<Instance<ComponentCtx, Expiry, Worker>>> + Send {
         async move {
-            let wasi = wasi_builder(&self.request, self.audit.clone()).map_err(wasmtime::Error::msg)?;
-            let mut store = Store::new(&self.engine, ComponentCtx::new(wasi, &self.request, &self.limits, self.audit.clone()));
+            let wasi = wasi_builder(&self.request, self.audit.clone(), None).map_err(wasmtime::Error::msg)?;
+            let mut store = Store::new(&self.engine, ComponentCtx::new(wasi, &self.request, &self.limits, self.audit.clone(), self.tools.clone()));
             store.limiter(|ctx| &mut ctx.limits);
             if self.limits.fuel > 0 {
                 store.set_fuel(self.limits.fuel)?;

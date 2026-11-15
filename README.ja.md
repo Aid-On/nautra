@@ -17,6 +17,7 @@
   <a href="#クイックスタート">クイックスタート</a> ·
   <a href="#権限">権限</a> ·
   <a href="#サービス">サービス</a> ·
+  <a href="#エージェントとツール">エージェント</a> ·
   <a href="#バックグラウンド実行">バックグラウンド</a> ·
   <a href="#イメージ">イメージ</a> ·
   <a href="#レジストリ">レジストリ</a> ·
@@ -126,6 +127,49 @@ GET /tide/pool from a wasm component
 
 `-p 8080` は、このマシンからの接続だけを受けます。ほかのマシンからも受けるなら、`-p 0.0.0.0:8080` と明示します。リクエストは並行して処理します。`--timeout` はリクエスト1件ごとの制限時間です。サービスに渡る権限も通常の実行と同じで、既定では何も渡りません。Ctrl-C か SIGTERM で止まります。
 
+## エージェントとツール
+
+Nautra では、エージェントも普通のコンポーネントです。外の世界とのやり取りはすべて HTTP リクエストで、URL ごとの意味は Nautra が決めます。モデルは「秘密の値を束縛した、許可済みのホスト」です。ツールは `http://tools.nautra/` にある1つの [MCP](https://modelcontextprotocol.io) サーバとして見えます。この名前へのリクエストは Nautra の外に出ません。その先にある各ツールは別のイメージで、呼び出しごとに新しく起動し、それぞれ独自の権限で動きます。
+
+ワークロードにどのツールを持たせるかは、ファイルに書きます。
+
+```toml
+# nautra.toml
+[agent]
+image = "ghcr.io/you/agent:v1"
+env = ["MODEL_URL=https://api.example.com/v1/chat/completions"]
+secrets = ["MODEL_KEY@api.example.com"]     # エージェントが持つのは身代わりの値
+timeout = "2m"
+max_tool_calls = 16
+
+[tools.read_file]
+image = "ghcr.io/you/fs-tools@sha256:…"     # ダイジェストで指定すれば固定になる
+description = "Read a file from the workspace."
+input = { type = "object", properties = { path = { type = "string" } }, required = ["path"] }
+mounts = ["./workspace:/work:ro"]           # このツールだけの権限。エージェントには渡らない
+
+[tools.upper]
+image = "upper:v1"                           # 権限なし。計算しかできない
+```
+
+```text
+$ nautra run -f nautra.toml "What does the note say?"
+The note says: THE TIDE IS IN
+```
+
+このファイルに書けるのは、`run` の行に書けることだけです。各項目の `mounts`、`net`、`env`、`secrets`、`timeout`、`memory`、`fuel` は同名のオプションと同じ意味で、同じパーサが読みます。ファイル内のパスは、ファイルの場所からの相対パスです。コマンドラインに書いたオプションは、`[agent]` の項目に追加されます。
+
+ツールにできるのは、コマンドとして動くイメージです。呼び出しの引数を標準入力から JSON で受け取り、標準出力に書いた内容が結果になります。そのため、手で試せます。
+
+```text
+$ echo '{"text": "tide"}' | nautra run -i upper:v1
+TIDE
+```
+
+引数は、ツールを起動する前にホスト側で `input` と照合します。拒否するときは何が違うかを返すので、モデルは呼び出しを直せます。ツールの `max_calls` と、エージェントの `max_tool_calls` は上限です。上限を超えた呼び出しにはエラーの結果を返し、何も実行しません。`--audit` を付けると、ツールの呼び出しも、ツール自身の通信も、同じファイルに記録します。
+
+[`examples/agent`](examples/agent) に、Almide で書いた100行ほどのエージェントと、ツール2つがあります。
+
 ## バックグラウンド実行
 
 `-d` を付けると、バックグラウンドで実行して ID を表示します。裏でデーモンが動くわけではありません。実体は、端末を持たない Nautra のプロセスがもう1つ動いているだけです。Nautra がその実行について知っていることは、`~/.nautra/runs` の下のディレクトリにすべて入っています。
@@ -220,7 +264,7 @@ OCI Distribution API に対応したレジストリなら、どれでも使え�
 
 **プレアルファです。** ここまでに書いた機能は動作し、macOS と CI 上の Linux で `scripts/integration.py` が検証しています。WASI 0.3 とその `wasi:http` は wasmtime でまだ実験的な扱いで、サービスの機能もその制約を受けます。push と pull はローカルの `registry:2` で検証済みですが、公開レジストリではまだ検証していません。
 
-次に取り組むのは、エージェントを動かすための機能です。ツールをイメージとして扱う仕組み、構成ファイル、実行を再生できる記録を予定しています（[ADR-0002](docs/adr/0002-agents.md)）。
+エージェント向けの機能は、[ADR-0002](docs/adr/0002-agents.md) に書いた順番で作っています。秘密の値の束縛、判定の記録、ツールは入りました。記録からの再生、ツール呼び出し前と完了前の検査、ほかのエージェントへの委任、外部の MCP サーバ、ネイティブコマンドの閉じ込めは、まだありません。
 
 まだ無いもの：
 

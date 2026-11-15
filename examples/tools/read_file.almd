@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+// A tool that reads one file under /work. It can read only what the entry
+// that declares it mounts there.
+import fs
+import io
+import json
+import path
+
+effect fn main() -> Unit = {
+  let arguments = json.parse(io.read_all())!
+  let name = value.get_string(arguments, "path") ?? ""
+  println(fs.read_text(path.join("/work", name))!)
+}

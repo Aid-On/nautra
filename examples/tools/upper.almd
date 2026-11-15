@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
+// A tool: reads its arguments as JSON on stdin, writes its result on stdout.
+// It needs no grant at all. Try it by hand:
+//   echo '{"text": "tide"}' | nautra run -i target/wasm/upper.wasm
+import io
+import json
+
+effect fn main() -> Unit = {
+  let arguments = json.parse(io.read_all())!
+  println(string.to_upper(value.get_string(arguments, "text") ?? ""))
+}

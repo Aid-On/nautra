@@ -34,10 +34,10 @@ class Nautra:
         self.binary = str(pathlib.Path(binary).resolve())
         self.home = home
 
-    def __call__(self, *args, env=None, cwd=None, home=None):
+    def __call__(self, *args, env=None, cwd=None, home=None, stdin=None):
         full = {"PATH": os.environ["PATH"], "HOME": str(self.home), "NAUTRA_HOME": str(home or self.home)}
         full.update(env or {})
-        done = subprocess.run([self.binary, *map(str, args)], capture_output=True, text=True, env=full, cwd=cwd, timeout=120)
+        done = subprocess.run([self.binary, *map(str, args)], capture_output=True, text=True, env=full, cwd=cwd, timeout=120, input=stdin)
         return done.returncode, done.stdout, done.stderr
 
 
@@ -181,6 +181,95 @@ def secret_checks(n, wasm, work):
     expect("the record holds no secret and no query string", token not in text and "key=q" not in text, text)
 
 
+def compose_checks(n, wasm, work):
+    """nautra.toml: a workload and the tools it may call, each an image with its own grants."""
+    project = work / "project"
+    (project / "ws").mkdir(parents=True)
+    (project / "ws" / "note.txt").write_text("the tide is in\n")
+    (project / "outside.txt").write_text("outside\n")
+    tools = f"""
+[tools.upper]
+image = "{wasm('upper')}"
+description = "Uppercase a text."
+input = {{ type = "object", properties = {{ text = {{ type = "string" }} }}, required = ["text"], additionalProperties = false }}
+
+[tools.read_file]
+image = "{wasm('read_file')}"
+description = "Read a file from the workspace."
+input = {{ type = "object", properties = {{ path = {{ type = "string" }} }}, required = ["path"] }}
+mounts = ["ws:/work:ro"]
+"""
+    (project / "nautra.toml").write_text(f'[agent]\nimage = "{wasm("toolcall")}"\naudit = "audit.jsonl"\n' + tools)
+    call = lambda *args: n("run", "-f", project / "nautra.toml", *args)
+
+    check("a tool runs by hand, arguments on stdin", n("run", "-i", wasm("upper"), stdin='{"text": "tide"}'), 0, out="TIDE")
+    check("the workload sees its tools", call(), 0, out="read_file: Read a file from the workspace.\nupper: Uppercase a text.")
+    check("a tool is called", call("upper", '{"text": "tide"}'), 0, out="TIDE")
+    check("a tool uses its own mount", call("read_file", '{"path": "note.txt"}'), 0, out="the tide is in")
+    check("a tool cannot leave its mount", call("read_file", '{"path": "../outside.txt"}'), 0, out="tool error", absent="outside\n")
+    check("arguments are checked against the schema", call("upper", '{"txt": "x", "text": 3}'), 0, out="arguments/text: 3 is not of type")
+    check("an unknown tool is refused", call("nope", "{}"), 1, err="no tool named 'nope'")
+    check("without a file there is no tool endpoint", n("run", wasm("toolcall")), 1, err="denied")
+    kinds = [(r["kind"], r["decision"], r.get("name")) for r in map(json.loads, (project / "audit.jsonl").read_text().splitlines())]
+    expect("tool calls are recorded", ("tool", "allow", "upper") in kinds and ("tool", "deny", "nope") in kinds, repr(kinds))
+    (project / "typo.toml").write_text(f'[agent]\nimage = "{wasm("toolcall")}"\n[tools.x]\nimage = "{wasm("upper")}"\nmount = []\n')
+    check("a mistake in the file is refused", n("run", "-f", project / "typo.toml"), 125, err="unknown key 'mount' in [tools.x]")
+    (project / "schema.toml").write_text(f'[agent]\nimage = "{wasm("toolcall")}"\n[tools.x]\nimage = "{wasm("upper")}"\ninput = {{ type = 7 }}\n')
+    check("a schema that is not one stops the run", n("run", "-f", project / "schema.toml"), 125, err="input schema is not valid")
+
+    # An agent: a model that asks for tools, and a key the agent never holds.
+    token = "model-key-s3cr3t"
+    asked = []
+
+    class Model(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+            asked.append((self.headers.get("Authorization"), body))
+            results = [m["content"] for m in body["messages"] if m["role"] == "tool"]
+            task = body["messages"][0]["content"]
+            if "loop" in task and not any("used up" in r for r in results):
+                message = {"role": "assistant", "tool_calls": [{"id": f"c{len(results)}", "type": "function", "function": {"name": "upper", "arguments": json.dumps({"text": "again"})}}]}
+            elif "loop" in task:
+                message = {"role": "assistant", "content": f"stopped after {len(results) - 1} calls"}
+            elif not results:
+                message = {"role": "assistant", "tool_calls": [{"id": "c0", "type": "function", "function": {"name": "read_file", "arguments": json.dumps({"path": "note.txt"})}}]}
+            elif len(results) == 1:
+                message = {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "upper", "arguments": json.dumps({"text": results[0]})}}]}
+            else:
+                message = {"role": "assistant", "content": f"The note says: {results[1]}"}
+            reply = json.dumps({"choices": [{"message": message}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(reply)))
+            self.end_headers()
+            self.wfile.write(reply)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Model)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = server.server_address[1]
+    (project / "agent.toml").write_text(
+        f'[agent]\nimage = "{wasm("agent")}"\nsecrets = ["MODEL_KEY@127.0.0.1:{port}"]\n'
+        f'env = ["MODEL_URL=http://127.0.0.1:{port}/v1/chat/completions", "MODEL_NAME=fixture"]\nmax_tool_calls = 3\ntimeout = "30s"\n' + tools)
+    env = {"MODEL_KEY": token}
+    done = n("run", "-f", project / "agent.toml", "What", "does", "the", "note", "say?", env=env)
+    check("an agent uses its tools to answer", done, 0, out="The note says: THE TIDE IS IN", absent=token)
+    expect("the model was offered the tools", [t["function"]["name"] for t in asked[0][1]["tools"]] == ["read_file", "upper"], repr(asked[0][1].get("tools")))
+    expect("the model received the real key", all(auth == f"Bearer {token}" for auth, _ in asked), repr([a for a, _ in asked]))
+    looped = n("run", "-f", project / "agent.toml", "loop", env=env)
+    check("the run's tool calls have a ceiling", looped, 0, out="stopped after 3 calls")
+    check("an agent needs its key", n("run", "-f", project / "agent.toml", "task"), 125, err="MODEL_KEY is not set")
+    started = n("run", "-d", "--name", "agent-bg", "-f", project / "agent.toml", "What does the note say?", env=env)
+    check("a composition runs in the background", started, 0)
+    for _ in range(100):
+        if "exited" in n("ps", "-a")[1]:
+            break
+        time.sleep(0.1)
+    check("its answer is in its log", n("logs", "agent-bg"), 0, out="The note says: THE TIDE IS IN")
+    n("rm", "agent-bg")
+
+
 def background_checks(n, wasm):
     """run -d, ps, logs, stop and rm: a run that outlives the command that started it."""
     port = free_port()
@@ -291,6 +380,7 @@ def run_checks(n, work):
     check("-p takes one port, not a mapping", n("run", "-p", "8080:80", wasm("web")), 125, err="no port of its own")
     service_checks(n, wasm)
     secret_checks(n, wasm, work)
+    compose_checks(n, wasm, work)
     background_checks(n, wasm)
 
     # Images: build, name, inspect, remove.

@@ -15,11 +15,13 @@ use serde_json::{json, Value};
 use wasmtime::component::{Component, Linker as ComponentLinker, ResourceTable};
 use wasmtime::{Config, Engine, Error, Linker, Module, Store, StoreLimits, StoreLimitsBuilder, Trap};
 use wasmtime_wasi::p1::WasiP1Ctx;
+use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
 use wasmtime_wasi::sockets::SocketAddrUse;
 use wasmtime_wasi::{FsPerms, I32Exit, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
 use outbound::{Audit, Outbound};
+use tools::Tools;
 
 #[path = "engine/inspect.rs"]
 mod inspect;
@@ -29,6 +31,8 @@ mod outbound;
 mod serve;
 #[path = "engine/spawn.rs"]
 mod spawn;
+#[path = "engine/tools.rs"]
+mod tools;
 #[path = "engine/upload.rs"]
 mod upload;
 
@@ -107,13 +111,13 @@ struct ComponentCtx {
 }
 
 impl ComponentCtx {
-    fn new(mut wasi: WasiCtxBuilder, request: &Value, limits: &Limits, audit: Option<Arc<Audit>>) -> ComponentCtx {
+    fn new(mut wasi: WasiCtxBuilder, request: &Value, limits: &Limits, audit: Option<Arc<Audit>>, tools: Option<Arc<Tools>>) -> ComponentCtx {
         ComponentCtx {
             wasi: wasi.build(),
             table: ResourceTable::new(),
             limits: store_limits(limits),
             http: WasiHttpCtx::new(),
-            outbound: Outbound::of(request, audit),
+            outbound: Outbound::of(request, audit, tools),
         }
     }
 }
@@ -135,7 +139,40 @@ struct ModuleCtx {
     limits: StoreLimits,
 }
 
+/// A run whose standard streams are memory instead of this process's: what
+/// it reads as stdin, and what it wrote.
+struct Capture {
+    stdin: Vec<u8>,
+    out: MemoryOutputPipe,
+    err: MemoryOutputPipe,
+}
+
+/// How a captured run ended and what it wrote.
+struct Captured {
+    exit_code: i64,
+    error: String,
+    stdout: String,
+    stderr: String,
+}
+
 fn run(request: &Value) -> Value {
+    run_with(request, None)
+}
+
+/// Runs a workload with `stdin` as its input and returns what it wrote. This
+/// is how a tool is called.
+fn run_captured(request: &Value, stdin: Vec<u8>) -> Captured {
+    let capture = Capture { stdin, out: MemoryOutputPipe::new(tools::MAX_BYTES), err: MemoryOutputPipe::new(tools::MAX_BYTES) };
+    let report = run_with(request, Some(&capture));
+    Captured {
+        exit_code: report["exit_code"].as_i64().unwrap_or(EXIT_REFUSED),
+        error: report["error"].as_str().unwrap_or("").to_owned(),
+        stdout: String::from_utf8_lossy(&capture.out.contents()).into_owned(),
+        stderr: String::from_utf8_lossy(&capture.err.contents()).into_owned(),
+    }
+}
+
+fn run_with(request: &Value, capture: Option<&Capture>) -> Value {
     let Some(path) = request["path"].as_str() else { return refused("run request has no path".into()) };
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -146,17 +183,22 @@ fn run(request: &Value) -> Value {
         Ok(engine) => engine,
         Err(error) => return refused(format!("engine setup failed: {error}")),
     };
-    let audit = match Audit::of(request) {
-        Ok(audit) => audit,
+    let prepared = Audit::of(request).and_then(|audit| {
+        let tools = Tools::of(request, audit.clone())?;
+        let wasi = wasi_builder(request, audit.clone(), capture)?;
+        Ok((audit, tools, wasi))
+    });
+    let (audit, tools, wasi) = match prepared {
+        Ok(prepared) => prepared,
         Err(reason) => return refused(reason),
     };
-    let wasi = match wasi_builder(request, audit.clone()) {
-        Ok(wasi) => wasi,
-        Err(reason) => return refused(reason),
-    };
+    let component = inspect::is_component(&bytes);
+    if tools.is_some() && !component {
+        return refused("tools are reached over wasi:http, which a core module does not have: build the workload as a component".into());
+    }
     let deadline = Deadline::arm(&engine, limits.timeout_ms);
-    let ended = if inspect::is_component(&bytes) {
-        run_component(&engine, &bytes, ComponentCtx::new(wasi, request, &limits, audit), &limits)
+    let ended = if component {
+        run_component(&engine, &bytes, ComponentCtx::new(wasi, request, &limits, audit, tools), &limits)
     } else {
         run_module(&engine, &bytes, wasi, &limits)
     };
@@ -213,7 +255,7 @@ impl Drop for Deadline {
 
 /// The guest's whole view of the host, built from the request and nothing
 /// else. Anything the request does not name stays closed.
-fn wasi_builder(request: &Value, audit: Option<Arc<Audit>>) -> Result<WasiCtxBuilder, String> {
+fn wasi_builder(request: &Value, audit: Option<Arc<Audit>>, capture: Option<&Capture>) -> Result<WasiCtxBuilder, String> {
     let mut wasi = WasiCtxBuilder::new();
     let args: Vec<String> = strings(&request["args"]);
     wasi.args(&args);
@@ -222,10 +264,19 @@ fn wasi_builder(request: &Value, audit: Option<Arc<Audit>>) -> Result<WasiCtxBui
             wasi.env(name, value);
         }
     }
-    if request["stdin"].as_bool().unwrap_or(false) {
-        wasi.inherit_stdin();
+    match capture {
+        Some(capture) => {
+            wasi.stdin(MemoryInputPipe::new(capture.stdin.clone()));
+            wasi.stdout(capture.out.clone());
+            wasi.stderr(capture.err.clone());
+        }
+        None => {
+            if request["stdin"].as_bool().unwrap_or(false) {
+                wasi.inherit_stdin();
+            }
+            wasi.inherit_stdout().inherit_stderr();
+        }
     }
-    wasi.inherit_stdout().inherit_stderr();
     for mount in request["mounts"].as_array().into_iter().flatten() {
         let (Some(host), Some(guest)) = (mount["host"].as_str(), mount["guest"].as_str()) else {
             return Err("a mount needs a host and a guest path".into());
