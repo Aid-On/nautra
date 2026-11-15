@@ -16,6 +16,7 @@
 <p align="center">
   <a href="#quick-start">Quick start</a> ·
   <a href="#grants">Grants</a> ·
+  <a href="#services">Services</a> ·
   <a href="#images">Images</a> ·
   <a href="#registries">Registries</a> ·
   <a href="#project-status">Status</a> ·
@@ -87,6 +88,7 @@ it belongs to the workload.
 | `-v HOST:GUEST[:ro]` | one directory, where the guest sees it; `:ro` for reads only |
 | `-e NAME=VALUE`, `-e NAME` | one variable; a bare name copies the host's value |
 | `--allow-net HOST:PORT` | one destination; also `HOST`, `*:PORT`, or `*` for all |
+| `-p [ADDRESS:]PORT` | where an HTTP service listens; this machine only unless an address is named |
 | `-i` | this terminal's stdin |
 | `-m 64m` | a memory ceiling |
 | `--timeout 30s` | a deadline (exit 124) |
@@ -100,12 +102,34 @@ $ nautra run --allow-net 127.0.0.1:8080 target/wasm/dial.wasm 127.0.0.1 8080
 connected to 127.0.0.1:8080
 ```
 
-A host name in `--allow-net` is resolved once, before the workload starts, so
-the workload cannot steer where a granted name points. A mount cannot be
-climbed out of with `..` or a symlink.
+A network grant covers sockets and outbound HTTP (`wasi:http`) alike. For
+sockets, a host name is resolved once, before the workload starts, so the
+workload cannot steer where a granted name points. For HTTP, the host named in
+the URL is matched against the grant, and a request anywhere else is refused
+before a connection is made. A mount cannot be climbed out of with `..` or a
+symlink.
 
 The workload's own exit code is passed through. `125` means nautra refused
 or could not start the run.
+
+## Services
+
+A component that exports an HTTP handler (`wasi:http`, 0.2 or 0.3) is a
+service. It has no port of its own — it exports a function, and the host
+decides where requests come from — so `-p` takes one port, not a mapping:
+
+```text
+$ nautra run -p 8080 target/wasm/web.wasm
+nautra: serving on http://127.0.0.1:8080
+
+$ curl http://127.0.0.1:8080/tide/pool
+GET /tide/pool from a wasm component
+```
+
+`-p 8080` listens on this machine only; `-p 0.0.0.0:8080` is the explicit way
+to accept connections from elsewhere. Requests are handled side by side,
+`--timeout` is a deadline per request, and the service is given the same
+grants as any run: nothing by default. It stops on Ctrl-C or SIGTERM.
 
 ## Images
 
@@ -185,13 +209,14 @@ token works as the password).
 ## Project status
 
 **Pre-alpha.** What is above works and is covered by `scripts/integration.py`
-on macOS; Linux is built in CI. Push and pull are tested against a local
+on macOS and, in CI, on Linux. WASI 0.3 and its `wasi:http` are still marked
+experimental in wasmtime, and services inherit that. Push and pull are tested against a local
 `registry:2`, and have not yet been verified against public registries.
 
 Not there yet:
 
-- serving HTTP (`wasi:http`) with a published port, and outbound `wasi:http`
 - long-running workloads: detached runs, logs, restart policy
+- TLS on a published port, and HTTP/2
 - several workloads together (compose) and networking between them
 - signing, provenance and policy on what may be pulled
 - credential helpers, a compiled-code cache, release binaries

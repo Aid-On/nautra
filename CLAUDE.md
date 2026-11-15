@@ -18,7 +18,8 @@ proposing a change in direction.
 | `src/image.almd` | Nautrafile, building an image, what an image asks for |
 | `src/registry.almd` | OCI Distribution: pull, push, authentication |
 | `src/engine.almd` | every `@extern` into the native side |
-| `native/engine.rs` | one run applied to wasmtime |
+| `native/engine.rs` | one run applied to wasmtime; the guest's view of the host, built from the request |
+| `native/engine/serve.rs` | an HTTP component served on a published address (`-p`) |
 | `native/engine/inspect.rs` | what a `.wasm` file is, without compiling it |
 | `native/engine/upload.rs` | stopgap: a byte-exact request body (see ADR-0001 §3) |
 | `examples/` | guest programs in Almide, built to `target/wasm` |

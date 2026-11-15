@@ -9,6 +9,9 @@ import self.grants
 @extern(rs, "engine", "nt_run")
 fn nt_run(request_json: String) -> String
 
+@extern(rs, "engine", "nt_serve")
+fn nt_serve(request_json: String) -> String
+
 @extern(rs, "engine", "nt_inspect")
 fn nt_inspect(path: String) -> String
 
@@ -70,11 +73,14 @@ fn request(path: String, argv: List[String], env: List[(String, String)], g: gra
     ("timeout_ms", value.int(g.timeout_ms)),
     ("fuel", value.int(g.fuel)),
     ("stdin", value.bool(g.stdin)),
+    ("listen", value.string(g.publish)),
   ])
 
-// Runs to completion on this process's stdout and stderr.
+// Runs to completion on this process's stdout and stderr. A request that
+// names an address to listen on is served there until interrupted.
 effect fn run(req: Value) -> Outcome = {
-  let doc = json.parse(nt_run(json.stringify(req)))!
+  let serving = (value.get_string(req, "listen") ?? "") != ""
+  let doc = json.parse(if serving then nt_serve(json.stringify(req)) else nt_run(json.stringify(req)))!
   Outcome { exit_code: value.get_int(doc, "exit_code") ?? 125, error: value.get_string(doc, "error") ?? "" }
 }
 

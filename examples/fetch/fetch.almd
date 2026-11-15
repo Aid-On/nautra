@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+// Fetches one URL over HTTP: needs its host granted with --allow-net.
+import env
+import http
+
+effect fn main() -> Unit = {
+  let target = list.get(env.args(), 0) ?? "http://example.com/"
+  let resp = http.get_response(target)!
+  println("${http.status(resp)} ${string.len(http.body(resp))} characters")
+}

@@ -107,6 +107,10 @@ local effect fn cmd_run(args: List[String]) -> Int = {
   if not list.is_empty(missing) then {
     eprintln("nautra: this image asks for grants this run does not give: ${list.join(missing, "  ")}")
   }
+  // An HTTP service exports a handler instead of a `run`; it has to be told
+  // where to listen.
+  let service = engine.inspect(target.path)!.exports |> list.any((name) => string.starts_with(name, "wasi:http/handler") or string.starts_with(name, "wasi:http/incoming-handler"))
+  guard not service or line.grants.publish != "" else err("this is an HTTP service: publish it with -p PORT, for example `nautra run -p 8080 ${line.image}`")!
   let request = engine.request(target.path, argv, environment(target.config, line.grants.env)!, line.grants)
   let outcome = engine.run(request)!
   if outcome.error != "" then {

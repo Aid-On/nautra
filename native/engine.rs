@@ -7,6 +7,7 @@
 //! no arguments beyond its own, an empty environment, a closed stdin, no
 //! directory and no network; each field of the request opens one thing.
 
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
@@ -16,13 +17,17 @@ use wasmtime::{Config, Engine, Error, Linker, Module, Store, StoreLimits, StoreL
 use wasmtime_wasi::p1::WasiP1Ctx;
 use wasmtime_wasi::sockets::SocketAddrUse;
 use wasmtime_wasi::{FsPerms, I32Exit, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi_http::{WasiBody, WasiHttpCtx, WasiHttpCtxView, WasiHttpHooks, WasiHttpView};
 
 #[path = "engine/inspect.rs"]
 mod inspect;
+#[path = "engine/serve.rs"]
+mod serve;
 #[path = "engine/upload.rs"]
 mod upload;
 
 pub use inspect::nt_inspect;
+pub use serve::nt_serve;
 pub use upload::nt_http_upload;
 
 /// Exit codes for runs that did not end by the guest's own choice, after the
@@ -76,15 +81,107 @@ struct Limits {
     timeout_ms: u64,
 }
 
+impl Limits {
+    fn of(request: &Value) -> Limits {
+        Limits {
+            memory_bytes: request["memory_bytes"].as_u64().unwrap_or(0) as usize,
+            fuel: request["fuel"].as_u64().unwrap_or(0),
+            timeout_ms: request["timeout_ms"].as_u64().unwrap_or(0),
+        }
+    }
+}
+
 struct ComponentCtx {
     wasi: WasiCtx,
     table: ResourceTable,
     limits: StoreLimits,
+    http: WasiHttpCtx,
+    outbound: HttpGrants,
+}
+
+impl ComponentCtx {
+    fn new(mut wasi: WasiCtxBuilder, request: &Value, limits: &Limits) -> ComponentCtx {
+        ComponentCtx {
+            wasi: wasi.build(),
+            table: ResourceTable::new(),
+            limits: store_limits(limits),
+            http: WasiHttpCtx::new(),
+            outbound: HttpGrants::from_request(&request["net"]),
+        }
+    }
 }
 
 impl WasiView for ComponentCtx {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView { ctx: &mut self.wasi, table: &mut self.table }
+    }
+}
+
+impl WasiHttpView for ComponentCtx {
+    fn http(&mut self) -> WasiHttpCtxView<'_> {
+        WasiHttpCtxView { ctx: &mut self.http, table: &mut self.table, hooks: &mut self.outbound }
+    }
+}
+
+/// The destinations a guest may send HTTP requests to: the same network
+/// grants as for sockets, matched here against the host the request names.
+/// `wasi:http` hands the host a URL, not a socket, so the name is what there
+/// is to check; the request is refused before any connection is made.
+struct HttpGrants {
+    rules: Vec<(String, Option<u16>)>,
+}
+
+impl HttpGrants {
+    fn from_request(net: &Value) -> HttpGrants {
+        let rules = match net["mode"].as_str().unwrap_or("none") {
+            "all" => vec![("*".to_owned(), None)],
+            "list" => net["allow"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|entry| {
+                    let port = entry["port"].as_u64().filter(|port| *port != 0).and_then(|port| u16::try_from(port).ok());
+                    (entry["host"].as_str().unwrap_or("*").to_owned(), port)
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        HttpGrants { rules }
+    }
+
+    fn admits(&self, host: &str, port: u16) -> bool {
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        self.rules.iter().any(|(granted, granted_port)| {
+            (granted == "*" || granted.eq_ignore_ascii_case(host)) && granted_port.is_none_or(|granted| granted == port)
+        })
+    }
+}
+
+impl WasiHttpHooks for HttpGrants {
+    fn send_request(
+        &mut self,
+        request: http::Request<WasiBody>,
+        options: Option<wasmtime_wasi_http::RequestOptions>,
+        _fut: Box<dyn Future<Output = Result<(), wasmtime_wasi_http::Error>> + Send>,
+    ) -> Box<
+        dyn Future<
+                Output = Result<
+                    (http::Response<WasiBody>, Box<dyn Future<Output = Result<(), wasmtime_wasi_http::Error>> + Send>),
+                    wasmtime_wasi_http::Error,
+                >,
+            > + Send,
+    > {
+        let secure = request.uri().scheme_str() == Some("https");
+        let port = request.uri().port_u16().unwrap_or(if secure { 443 } else { 80 });
+        let admitted = request.uri().host().is_some_and(|host| self.admits(host, port));
+        Box::new(async move {
+            use http_body_util::BodyExt;
+            if !admitted {
+                return Err(wasmtime_wasi_http::Error::HttpRequestDenied);
+            }
+            let (response, io) = wasmtime_wasi_http::default_send_request(request, options).await?;
+            Ok((response.map(BodyExt::boxed_unsync), Box::new(io) as Box<dyn Future<Output = _> + Send>))
+        })
     }
 }
 
@@ -99,11 +196,7 @@ fn run(request: &Value) -> Value {
         Ok(bytes) => bytes,
         Err(error) => return refused(format!("cannot read {path}: {error}")),
     };
-    let limits = Limits {
-        memory_bytes: request["memory_bytes"].as_u64().unwrap_or(0) as usize,
-        fuel: request["fuel"].as_u64().unwrap_or(0),
-        timeout_ms: request["timeout_ms"].as_u64().unwrap_or(0),
-    };
+    let limits = Limits::of(request);
     let engine = match Engine::new(&engine_config(&limits)) {
         Ok(engine) => engine,
         Err(error) => return refused(format!("engine setup failed: {error}")),
@@ -114,7 +207,7 @@ fn run(request: &Value) -> Value {
     };
     let deadline = Deadline::arm(&engine, limits.timeout_ms);
     let ended = if inspect::is_component(&bytes) {
-        run_component(&engine, &bytes, wasi, &limits)
+        run_component(&engine, &bytes, ComponentCtx::new(wasi, request, &limits), &limits)
     } else {
         run_module(&engine, &bytes, wasi, &limits)
     };
@@ -283,10 +376,9 @@ fn run_module(engine: &Engine, bytes: &[u8], mut wasi: WasiCtxBuilder, limits: &
 
 /// A component: `wasi:cli/run`, through the WASI 0.3 interfaces when it
 /// imports them and the 0.2 ones otherwise.
-fn run_component(engine: &Engine, bytes: &[u8], mut wasi: WasiCtxBuilder, limits: &Limits) -> Ended {
+fn run_component(engine: &Engine, bytes: &[u8], ctx: ComponentCtx, limits: &Limits) -> Ended {
     let component = Component::from_binary(engine, bytes).map_err(|error| format!("not a runnable component: {error}"))?;
     let p3 = component.component_type().imports(engine).any(|(name, _)| name.starts_with("wasi:") && name.contains("@0.3"));
-    let ctx = ComponentCtx { wasi: wasi.build(), table: ResourceTable::new(), limits: store_limits(limits) };
     let mut store = Store::new(engine, ctx);
     store.limiter(|ctx| &mut ctx.limits);
     prepare(&mut store, limits);
@@ -294,6 +386,7 @@ fn run_component(engine: &Engine, bytes: &[u8], mut wasi: WasiCtxBuilder, limits
     let ran: Result<Result<Result<(), ()>, Error>, String> = if p3 {
         use wasmtime_wasi::p3::bindings::Command;
         wasmtime_wasi::p3::add_to_linker(&mut linker).map_err(|error| format!("linker setup failed: {error}"))?;
+        wasmtime_wasi_http::p3::add_to_linker(&mut linker).map_err(|error| format!("linker setup failed: {error}"))?;
         wasmtime_wasi::runtime::in_tokio(async {
             let command = Command::instantiate_async(&mut store, &component, &linker).await.map_err(|error| not_a_command(&error))?;
             Ok(match store.run_concurrent(async |accessor| command.wasi_cli_run().call_run(accessor).await).await {
@@ -304,6 +397,7 @@ fn run_component(engine: &Engine, bytes: &[u8], mut wasi: WasiCtxBuilder, limits
     } else {
         use wasmtime_wasi::p2::bindings::Command;
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|error| format!("linker setup failed: {error}"))?;
+        wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker).map_err(|error| format!("linker setup failed: {error}"))?;
         wasmtime_wasi::runtime::in_tokio(async {
             let command = Command::instantiate_async(&mut store, &component, &linker).await.map_err(|error| not_a_command(&error))?;
             Ok(command.wasi_cli_run().call_run(&mut store).await)

@@ -1,0 +1,9 @@
+// SPDX-License-Identifier: Apache-2.0
+// A small HTTP service: answers every request with its method and path.
+// Run it with `nautra run -p 8080 target/wasm/web.wasm`.
+import http
+
+fn handle(req: HttpRequest) -> HttpResponse =
+  http.response(200, "${http.method(req)} ${http.path(req)} from a wasm component\n")
+
+effect fn main() -> Unit = http.serve(8080, handle)!

@@ -13,10 +13,15 @@ also check push and pull.
 import http.server
 import os
 import pathlib
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
+import time
+import urllib.error
+import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 WASM = ROOT / "target" / "wasm"
@@ -55,9 +60,77 @@ def check(name, got, want_code, out=None, err=None, absent=None):
 
 def listener():
     """A TCP port on loopback that accepts connections, for the network checks."""
-    server = http.server.HTTPServer(("127.0.0.1", 0), http.server.BaseHTTPRequestHandler)
+    class Quiet(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"hello from the host\n"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Quiet)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server.server_address[1]
+
+
+def free_port():
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def fetch(url, data=None):
+    """(status, body) of one request, or (0, reason) when it could not be made."""
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=10) as reply:
+            return reply.status, reply.read().decode()
+    except urllib.error.HTTPError as error:
+        return error.code, ""
+    except OSError as error:
+        return 0, str(error)
+
+
+def expect(name, condition, detail=""):
+    if condition:
+        print(f"ok    {name}")
+    else:
+        failures.append(name)
+        print(f"FAIL  {name}: {detail}")
+
+
+def service_checks(n, wasm):
+    """An HTTP component published with -p, requested, and stopped."""
+    port = free_port()
+    env = {"PATH": os.environ["PATH"], "HOME": str(n.home), "NAUTRA_HOME": str(n.home)}
+    server = subprocess.Popen([n.binary, "run", "-p", str(port), "--timeout", "5s", str(wasm("web"))], env=env, stderr=subprocess.PIPE, text=True)
+    try:
+        for _ in range(100):
+            if fetch(f"http://127.0.0.1:{port}/ready")[0]:
+                break
+            time.sleep(0.1)
+        status, body = fetch(f"http://127.0.0.1:{port}/tide/pool")
+        expect("a published service answers", status == 200 and "GET /tide/pool" in body, f"{status} {body!r}")
+        status, body = fetch(f"http://127.0.0.1:{port}/in", data=b"x")
+        expect("a published service sees the method", status == 200 and "POST /in" in body, f"{status} {body!r}")
+        replies = []
+        threads = [threading.Thread(target=lambda i=i: replies.append(fetch(f"http://127.0.0.1:{port}/c{i}"))) for i in range(16)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        expect("requests are served side by side", sorted(body for _, body in replies) == sorted(f"GET /c{i} from a wasm component\n" for i in range(16)), repr(replies))
+    finally:
+        server.send_signal(signal.SIGTERM)
+        try:
+            code = server.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            code = None
+        expect("a service stops cleanly on SIGTERM", code == 0, f"exit {code}")
+        expect("a service says where it listens", f"serving on http://127.0.0.1:{port}" in server.stderr.read())
 
 
 def run_checks(n, work):
@@ -107,6 +180,19 @@ def run_checks(n, work):
     check("another host stays closed", dial("--allow-net", f"192.0.2.1:{port}"), 1, err="permission denied")
     check("a name is granted by what it resolves to", n("run", "--allow-net", f"localhost:{port}", wasm("dial"), "localhost", port), 0, out="connected")
     check("* opens every destination", dial("--allow-net", "*"), 0, out="connected")
+
+    # HTTP out: `wasi:http` requests are held to the same grants, by host name.
+    get = lambda url, *grants: n("run", *grants, wasm("fetch"), url)
+    check("no outbound http by default", get(f"http://127.0.0.1:{port}/"), 1, err="denied")
+    check("a granted host is fetched", get(f"http://127.0.0.1:{port}/", "--allow-net", f"127.0.0.1:{port}"), 0, out="characters")
+    check("outbound http on another port is refused", get(f"http://127.0.0.1:{port}/", "--allow-net", "127.0.0.1:9"), 1, err="denied")
+    check("outbound http is granted by the name in the URL", get(f"http://127.0.0.1:{port}/", "--allow-net", f"localhost:{port}"), 1, err="denied")
+
+    # HTTP in: a service is published where -p says, and nowhere otherwise.
+    check("a service needs -p", n("run", wasm("web")), 125, err="publish it with -p")
+    check("-p needs a service", n("run", "-p", free_port(), wasm("hello")), 125, err="no HTTP handler")
+    check("-p takes one port, not a mapping", n("run", "-p", "8080:80", wasm("web")), 125, err="no port of its own")
+    service_checks(n, wasm)
 
     # Images: build, name, inspect, remove.
     (work / "files.wasm").write_bytes(wasm("files").read_bytes())

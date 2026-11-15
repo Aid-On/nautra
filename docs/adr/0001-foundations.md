@@ -85,7 +85,18 @@ that is itself an ordinary process.
 engine's attack surface and the reason it needs root. A Wasm workload needs
 neither.
 
-## 7. Open core, split by who needs it
+## 7. A service is published, not mapped
+
+A component that exports a `wasi:http` handler is served with `-p PORT`. The
+option takes one port, on this machine only unless an address is written
+(`-p 0.0.0.0:8080`). There is no `HOST:CONTAINER` mapping and no `EXPOSE`.
+
+*Why:* a Wasm HTTP service exports a function; it never binds a port, so
+there is nothing inside to map to. Listening on every interface by default is
+a known way container ports end up reachable from a network nobody meant, so
+the wider reach is the one that has to be spelled out.
+
+## 8. Open core, split by who needs it
 
 Capabilities an individual or a single team needs to build, ship and run Wasm
 workloads are Community Edition (Apache-2.0). Capabilities that exist because

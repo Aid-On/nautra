@@ -20,6 +20,8 @@ type Grants = {
   timeout_ms: Int,
   fuel: Int,
   stdin: Bool,
+  // The address an HTTP service is published on, or "" for an ordinary run.
+  publish: String,
 }
 
 // A parsed `nautra run` line: the grants, the image, and the guest's arguments.
@@ -34,6 +36,7 @@ fn nothing() -> Grants = Grants {
   timeout_ms: 0,
   fuel: 0,
   stdin: false,
+  publish: "",
 }
 
 // `HOST:GUEST[:ro|:rw]`. The guest path is where the workload sees the
@@ -85,6 +88,22 @@ fn parse_net(text: String) -> NetRule! = {
   }
 }
 
+local fn is_number(text: String) -> Bool = text != "" and string.to_list(text) |> list.all(string.is_digit)
+
+// Where an HTTP service listens: `PORT` (this machine only) or `ADDRESS:PORT`.
+// A Wasm service exports a handler and has no port of its own, so there is
+// no second port to map to.
+fn parse_publish(text: String) -> String! = {
+  let (address, port) = match string.last_index_of(text, ":") {
+    some(i) => (string.take(text, i), string.drop(text, i + 1)),
+    none => ("127.0.0.1", text),
+  }
+  guard not is_number(address) else err("'${text}' maps one port to another, but a Wasm service has no port of its own: write -p ${address}")
+  guard address != "" else err("'${text}' names no address")
+  let _ = parse_port(port, text)!
+  "${address}:${port}"
+}
+
 local fn scaled(text: String, units: List[(String, Int)], what: String) -> Int! = {
   let lower = string.to_lower(text)
   let (digits, factor) = units
@@ -107,6 +126,7 @@ local fn with_value(g: Grants, flag: String, text: String) -> Grants! = match fl
   "-v" | "--volume" => { ...g, mounts: g.mounts + [parse_mount(text)!] },
   "-e" | "--env" => { ...g, env: g.env + [parse_env(text)!] },
   "--allow-net" => if text == "*" then { ...g, net_all: true } else { ...g, net: g.net + [parse_net(text)!] },
+  "-p" | "--publish" => { ...g, publish: parse_publish(text)! },
   "-m" | "--memory" => { ...g, memory_bytes: parse_size(text)! },
   "--timeout" => { ...g, timeout_ms: parse_duration(text)! },
   "--fuel" => {
@@ -118,7 +138,7 @@ local fn with_value(g: Grants, flag: String, text: String) -> Grants! = match fl
 }
 
 local fn takes_value(flag: String) -> Bool =
-  list.contains(["-v", "--volume", "-e", "--env", "--allow-net", "-m", "--memory", "--timeout", "--fuel"], flag)
+  list.contains(["-v", "--volume", "-e", "--env", "--allow-net", "-p", "--publish", "-m", "--memory", "--timeout", "--fuel"], flag)
 
 // Options come before the image; everything after it belongs to the guest.
 fn parse_run(args: List[String]) -> RunLine! = {
@@ -208,4 +228,14 @@ test "mistakes are refused, not guessed" {
   assert(result.is_err(parse_run(["-v", "data", "app"])))
   assert(result.is_err(parse_run(["-v", "./a:rel", "app"])))
   assert(result.is_err(parse_run(["-v", "./a:/a:exec", "app"])))
+}
+
+test "a service is published on this machine unless an address is named" {
+  assert_eq(parse_publish("8080"), ok("127.0.0.1:8080"))
+  assert_eq(parse_publish("0.0.0.0:8080"), ok("0.0.0.0:8080"))
+  assert_eq(parse_publish("[::1]:8080"), ok("[::1]:8080"))
+  assert(result.is_err(parse_publish("8080:80")))
+  assert(result.is_err(parse_publish("http")))
+  assert(result.is_err(parse_publish(":8080")))
+  assert_eq(parse_run(["-p", "8080", "web"])!.grants.publish, "127.0.0.1:8080")
 }
