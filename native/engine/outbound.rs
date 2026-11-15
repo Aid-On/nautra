@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! What leaves a guest over `wasi:http`: which destinations it may reach,
-//! which secrets are put on which requests, and the record of both.
+//! which secrets are put on which requests, which requests are signed, and
+//! the record of all three.
 //!
 //! `wasi:http` hands the host a whole request rather than a socket, so this is
 //! the one place every outbound HTTP request passes through, before any
@@ -19,6 +20,7 @@ use serde_json::{json, Value};
 use wasmtime_wasi_http::{Error, RequestOptions, WasiBody, WasiHttpHooks};
 
 use super::journal::Journal;
+use super::signer;
 use super::tools::{self, Tools};
 
 /// The record of what a run did at its boundary: one JSON object per line,
@@ -101,10 +103,97 @@ impl Secret {
     }
 }
 
+/// Destinations whose requests are signed on the way out (ADR-0004). The
+/// guest holds nothing and writes nothing for it.
+#[derive(Clone)]
+struct Signing {
+    scheme: String,
+    region: String,
+    service: String,
+    hosts: Vec<(String, u16)>,
+}
+
+impl Signing {
+    fn of(entry: &Value) -> Option<Signing> {
+        let hosts = entry["hosts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|host| Some((host["host"].as_str()?.to_owned(), u16::try_from(host["port"].as_u64()?).ok()?)))
+            .collect();
+        Some(Signing {
+            scheme: entry["scheme"].as_str()?.to_owned(),
+            region: entry["region"].as_str()?.to_owned(),
+            service: entry["service"].as_str()?.to_owned(),
+            hosts,
+        })
+    }
+
+    fn bound_to(&self, host: &str, port: u16) -> bool {
+        self.hosts.iter().any(|(bound, bound_port)| bound.eq_ignore_ascii_case(host) && *bound_port == port)
+    }
+}
+
+/// The largest body read whole to be signed.
+const MAX_SIGNED_BODY: usize = 32 << 20;
+
+/// The headers a signature is written in. A guest's own are dropped: it
+/// cannot bring a signature made elsewhere through a host nautra signs for.
+const SIGNATURE_HEADERS: [&str; 4] = ["authorization", "x-amz-date", "x-amz-security-token", "x-amz-content-sha256"];
+
+/// Signs `request` as `signing` says: reads its body whole, asks nautra's
+/// signing copy for the headers, and puts them on. `Err` is why it could not.
+async fn sign(request: http::Request<WasiBody>, signing: &Signing) -> Result<http::Request<WasiBody>, String> {
+    use http_body_util::BodyExt;
+    use sha2::Digest;
+    let (mut parts, body) = request.into_parts();
+    let body = http_body_util::Limited::new(body, MAX_SIGNED_BODY)
+        .collect()
+        .await
+        .map_err(|_| format!("a request is signed over its whole body, and this one could not be read, or is over {} MiB", MAX_SIGNED_BODY >> 20))?
+        .to_bytes();
+    for name in SIGNATURE_HEADERS {
+        parts.headers.remove(name);
+    }
+    let host = match parts.headers.get(http::header::HOST).and_then(|value| value.to_str().ok()) {
+        Some(host) => host.to_owned(),
+        None => parts.uri.authority().map(|authority| authority.as_str().to_owned()).unwrap_or_default(),
+    };
+    // Signed beside host and the date: the content type, and what the guest
+    // addressed to AWS by name. The rest travels unsigned, so that a header
+    // rewritten on the way does not break the signature.
+    let headers: Vec<Value> = parts
+        .headers
+        .iter()
+        .filter(|(name, _)| *name == http::header::CONTENT_TYPE || name.as_str().starts_with("x-amz-"))
+        .filter_map(|(name, value)| Some(json!([name.as_str(), value.to_str().ok()?])))
+        .collect();
+    let digest: String = sha2::Sha256::digest(&body).iter().map(|byte| format!("{byte:02x}")).collect();
+    let question = json!({
+        "region": signing.region,
+        "service": signing.service,
+        "method": parts.method.as_str(),
+        "host": host,
+        "path": parts.uri.path(),
+        "query": parts.uri.query().unwrap_or(""),
+        "headers": headers,
+        "body_sha256": digest,
+    });
+    let answered = tokio::task::spawn_blocking(move || signer::ask(&question)).await.map_err(|error| error.to_string())??;
+    for (name, value) in answered {
+        let name = http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| "the signature names a header that is not one".to_owned())?;
+        let mut value = HeaderValue::from_str(&value).map_err(|_| "the signature has a value no header can carry".to_owned())?;
+        value.set_sensitive(true);
+        parts.headers.insert(name, value);
+    }
+    Ok(http::Request::from_parts(parts, whole(body)))
+}
+
 /// The outbound policy of one guest.
 pub(super) struct Outbound {
     rules: Vec<(String, Option<u16>)>,
     secrets: Vec<Secret>,
+    signs: Vec<Signing>,
     audit: Option<Arc<Audit>>,
     tools: Option<Arc<Tools>>,
     journal: Option<Arc<Journal>>,
@@ -114,6 +203,8 @@ pub(super) struct Outbound {
 struct Verdict {
     refusal: Option<String>,
     secrets: Vec<String>,
+    /// How the request is to be signed before it is sent, when it is.
+    signing: Option<Signing>,
 }
 
 impl Outbound {
@@ -140,7 +231,12 @@ impl Outbound {
         for secret in &secrets {
             rules.extend(secret.hosts.iter().map(|(host, port)| (host.clone(), Some(*port))));
         }
-        Outbound { rules, secrets, audit, tools, journal }
+        // Naming a host to sign for is the same grant, for the same reason.
+        let signs: Vec<Signing> = request["sign"].as_array().into_iter().flatten().filter_map(Signing::of).collect();
+        for signing in &signs {
+            rules.extend(signing.hosts.iter().map(|(host, port)| (host.clone(), Some(*port))));
+        }
+        Outbound { rules, secrets, signs, audit, tools, journal }
     }
 
     fn admits(&self, host: &str, port: u16) -> bool {
@@ -155,7 +251,7 @@ impl Outbound {
     /// connection, the URL itself — refuses the request: the guest is trying
     /// to send a secret somewhere it was not bound to go.
     fn decide(&self, request: &mut http::Request<WasiBody>, host: &str, port: u16, secure: bool) -> Verdict {
-        let mut verdict = Verdict { refusal: None, secrets: Vec::new() };
+        let mut verdict = Verdict { refusal: None, secrets: Vec::new(), signing: None };
         if !self.admits(host, port) {
             verdict.refusal = Some("the destination is not granted".into());
             return verdict;
@@ -182,6 +278,13 @@ impl Outbound {
             }
             if verdict.refusal.is_some() {
                 return verdict;
+            }
+        }
+        if let Some(signing) = self.signs.iter().find(|signing| signing.bound_to(host, port)) {
+            if !secure && !is_loopback(host) {
+                verdict.refusal = Some("requests to this destination are signed, and not sent over an unencrypted connection".into());
+            } else {
+                verdict.signing = Some(signing.clone());
             }
         }
         verdict
@@ -236,8 +339,17 @@ fn whole(bytes: Bytes) -> WasiBody {
 }
 
 /// A request sent as it is, its response streamed back: an ordinary run.
-async fn send_live(request: http::Request<WasiBody>, options: Option<RequestOptions>, verdict: Verdict, mut record: Value, audit: Option<Arc<Audit>>) -> Sent {
+async fn send_live(request: http::Request<WasiBody>, options: Option<RequestOptions>, mut verdict: Verdict, mut record: Value, audit: Option<Arc<Audit>>) -> Sent {
     use http_body_util::BodyExt;
+    // Signed last, here, so that a replay — which sends nothing — asks for
+    // no signature. A request that cannot be signed is not sent.
+    let mut request = Some(request);
+    if let (None, Some(signing)) = (&verdict.refusal, verdict.signing.take()) {
+        match sign(request.take().expect("the request is still here"), &signing).await {
+            Ok(signed) => request = Some(signed),
+            Err(reason) => verdict.refusal = Some(format!("the request could not be signed: {reason}")),
+        }
+    }
     if let Some(reason) = verdict.refusal {
         record["reason"] = json!(reason);
         if let Some(audit) = &audit {
@@ -245,6 +357,7 @@ async fn send_live(request: http::Request<WasiBody>, options: Option<RequestOpti
         }
         return Err(Error::HttpRequestDenied);
     }
+    let Some(request) = request else { return Err(Error::HttpRequestDenied) };
     let sent = wasmtime_wasi_http::default_send_request(request, options).await;
     match &sent {
         Ok((response, _)) => record["status"] = json!(response.status().as_u16()),
@@ -339,7 +452,7 @@ impl WasiHttpHooks for Outbound {
         let verdict = self.decide(&mut request, &host, port, secure);
         // The audit names where a request went and what it carried, never
         // the query string or a header value.
-        let record = json!({
+        let mut record = json!({
             "kind": "http",
             "decision": if verdict.refusal.is_none() { "allow" } else { "deny" },
             "method": request.method().as_str(),
@@ -349,6 +462,9 @@ impl WasiHttpHooks for Outbound {
             "path": request.uri().path(),
             "secrets": verdict.secrets,
         });
+        if let Some(signing) = &verdict.signing {
+            record["signed"] = json!(signing.scheme);
+        }
         let audit = self.audit.clone();
         match self.journal.clone() {
             Some(journal) => Box::new(send_recorded(journal, request, options, verdict, record, audit)),

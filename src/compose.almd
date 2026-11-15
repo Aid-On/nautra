@@ -53,7 +53,7 @@ type Composition = {
   invoke_token: String,
 }
 
-local let GRANT_KEYS = ["mounts", "net", "env", "secrets", "timeout", "memory", "fuel"]
+local let GRANT_KEYS = ["mounts", "net", "env", "secrets", "sign", "timeout", "memory", "fuel"]
 
 local fn only_keys(table: Value, allowed: List[String], where: String) -> Unit! = {
   let keys = (value.as_object(table) |> result.map_err((_) => "${where} must be a table")!) |> list.map(((k, _)) => k)
@@ -107,7 +107,8 @@ local fn grant_options(table: Value, base: String, where: String) -> List[String
   let timeout = option.to_list(text(table, "timeout", where)!) |> list.flat_map((t) => ["--timeout", t])
   let memory = option.to_list(text(table, "memory", where)!) |> list.flat_map((m) => ["-m", m])
   let fuel = count(table, "fuel", where)!
-  mounts + net + env + secrets + timeout + memory + (if fuel > 0 then ["--fuel", int.to_string(fuel)] else [])
+  let signs = strings(table, "sign", where)! |> list.flat_map((s) => ["--sign", s])
+  mounts + net + env + secrets + signs + timeout + memory + (if fuel > 0 then ["--fuel", int.to_string(fuel)] else [])
 }
 
 local fn is_tool_name(name: String) -> Bool =

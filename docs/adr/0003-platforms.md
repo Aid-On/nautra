@@ -136,6 +136,7 @@ Wasm still works.
 - **Signed model requests.** A secret here is a value put on a request for
   the hosts it is bound to. A model endpoint that wants each request signed
   (AWS SigV4) does not fit that; either an API key is used or the host signs.
+  Decided in ADR-0004: the host signs.
 - **Release artifacts**: binaries for both architectures and a container
   image of nautra itself.
 

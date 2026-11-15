@@ -20,6 +20,7 @@ import self.oci
 import self.reference
 import self.registry
 import self.runs
+import self.signer
 import self.store
 
 // A workload ready to run: the binary on disk, the name it sees itself run
@@ -142,6 +143,11 @@ local effect fn prepare(line: grants.RunLine, mode: String, written: List[String
   guard not service or line.grants.publish != "" else err("this is an HTTP service: publish it with -p PORT, for example `nautra run -p 8080 ${line.image}`")!
   // A replay sends nothing anywhere, so it needs no secret's value.
   let secrets = bind_secrets(line.grants.secrets, mode != "replay")!
+  // Nor a signature: but a run that will sign is refused now, not at its
+  // first request, when the host has no credentials to sign with.
+  if mode != "replay" and not list.is_empty(line.grants.signs) then {
+    signer.ready() |> result.map_err((e) => "--sign: ${e}")!
+  }
   // The guest holds each secret's placeholder under the secret's name.
   let env_pairs = (environment(target.config, line.grants.env)! |> list.filter(((name, _)) => not list.any(secrets, (s) => s.name == name)))
     + (secrets |> list.map((s) => (s.name, s.placeholder)))
@@ -697,6 +703,8 @@ local effect fn dispatch(args: List[String]) -> Int = {
     // Not a command for a person: nautra starts itself with this to run one
     // native tool or check confined (see native.almd).
     "__native" => native.run(list.get(rest, 0) ?? "")!,
+    // Nor this: nautra starts itself with it to sign requests (signer.almd).
+    "__sign" => signer.run()!,
     "version" | "--version" | "-V" => {
       println("nautra ${help.VERSION}")
       0

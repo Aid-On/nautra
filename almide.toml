@@ -22,6 +22,14 @@ native = ["porta_sandbox"]
 # Porta's develop branch, pinned to a commit by almide.lock; a tag once Porta
 # releases with the package.
 porta_sandbox = { git = "https://github.com/almide/porta", branch = "develop", subdir = "sandbox" }
+# AWS Signature Version 4, in pure Almide: what signs a request for a
+# destination granted with --sign (ADR-0004).
+sigv4 = { git = "https://github.com/O6lvl4/sigv4", tag = "v0.1.0" }
+
+# Almide builds a dependency from outside github.com/almide only when its
+# owner is named here.
+[trust]
+owners = ["github.com/o6lvl4"]
 
 # The only native code is the engine: wasmtime, the two parsers it needs (the
 # wasm binary format for `inspect`, TOML for the Nautrafile), and JSON Schema

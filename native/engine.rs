@@ -34,6 +34,8 @@ mod native;
 mod outbound;
 #[path = "engine/serve.rs"]
 mod serve;
+#[path = "engine/signer.rs"]
+mod signer;
 #[path = "engine/spawn.rs"]
 mod spawn;
 #[path = "engine/tools.rs"]

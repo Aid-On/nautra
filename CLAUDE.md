@@ -6,7 +6,7 @@ decides; Rust for the engine (wasmtime). Design decisions:
 [docs/adr/](docs/adr/) — read them before proposing a change in direction.
 ADR-0001 is the foundation; ADR-0002 is how agents run here and the order
 that work is done in; ADR-0003 is hosted agent platforms and publishing
-tools over MCP.
+tools over MCP; ADR-0004 is requests the host signs (AWS).
 
 ## Layout
 
@@ -21,10 +21,12 @@ tools over MCP.
 | `src/registry.almd` | OCI Distribution: pull, push, authentication |
 | `src/compose.almd` | `nautra.toml`: a workload and its tools, read into `run` options; or, with `[mcp]`, tools published with no workload; `[invoke]`, a workload run once per request |
 | `src/native.almd` | a native tool or check: nautra's grants turned into one request to Porta's sandbox (`porta_sandbox`, a dependency), and the hidden `__native` entry that applies it |
+| `src/signer.almd` | `--sign`: the hidden `__sign` entry, which finds the AWS credentials and signs a request the engine describes, with the `sigv4` library (a dependency) |
 | `src/runs.almd` | background runs: the record, the log, stop and remove |
 | `src/engine.almd` | every `@extern` into the native side |
 | `native/engine.rs` | one run applied to wasmtime; the guest's view of the host, built from the request |
-| `native/engine/outbound.rs` | outbound `wasi:http`: destinations, secrets, the audit record |
+| `native/engine/outbound.rs` | outbound `wasi:http`: destinations, secrets, signed requests, the audit record |
+| `native/engine/signer.rs` | starts nautra once more to sign requests, and asks it over a pipe |
 | `native/engine/journal.rs` | `--record`: the exchanges of a run, replayed or resumed |
 | `native/engine/native.rs` | starts nautra once more for a native tool or check and collects its output |
 | `native/engine/tools.rs` | the MCP endpoint at `tools.nautra`; a tool call is a captured run |
@@ -90,6 +92,9 @@ need glibc 2.39; the image carries its own.
 - An exchange a record shows as begun and not ended is never repeated.
 - A secret's real value exists only in the host process: the guest holds a
   placeholder, and no record, log or run file holds the value.
+- A request to a destination that is signed for is never sent unsigned. The
+  signing key is read and used only by nautra's signing copy: it is not in a
+  run's request document, and the guest holds nothing for it.
 - Policy stays in Almide. The native side applies a finished request. A
   tool's whole run request is prepared before the workload starts; the
   engine only looks it up by name when the tool is called.

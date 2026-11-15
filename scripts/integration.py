@@ -182,6 +182,118 @@ def secret_checks(n, wasm, work):
     expect("the record holds no secret and no query string", token not in text and "key=q" not in text, text)
 
 
+def aws_signature(secret, method, host, path, query, headers, body, signed_names, stamp, region, service):
+    """AWS Signature Version 4 of one request, worked out here with hashlib and
+    hmac alone: what a service computes to check the signature it was sent."""
+    import hashlib
+    import hmac
+    from urllib.parse import quote, unquote_to_bytes
+
+    def once(text):
+        return quote(unquote_to_bytes(text), safe="-_.~")
+
+    segments = [quote(s, safe="-_.~") for s in path.split("/")[1:] if s not in ("", ".")]
+    canonical_path = "/" + "/".join(segments) + ("/" if path.endswith("/") and segments else "")
+    pairs = sorted((once(k), once(v)) for k, _, v in (p.partition("=") for p in query.split("&") if p))
+    lines = "".join(f"{name}:{' '.join(headers[name].split())}\n" for name in signed_names)
+    canonical = "\n".join([method, canonical_path, "&".join(f"{k}={v}" for k, v in pairs), lines, ";".join(signed_names), hashlib.sha256(body).hexdigest()])
+    scope = f"{stamp[:8]}/{region}/{service}/aws4_request"
+    to_sign = "\n".join(["AWS4-HMAC-SHA256", stamp, scope, hashlib.sha256(canonical.encode()).hexdigest()])
+    key = ("AWS4" + secret).encode()
+    for part in (stamp[:8], region, service, "aws4_request"):
+        key = hmac.new(key, part.encode(), hashlib.sha256).digest()
+    return hmac.new(key, to_sign.encode(), hashlib.sha256).hexdigest()
+
+
+def sign_checks(n, wasm, project, tools):
+    """--sign: requests to a destination are signed by nautra; the guest holds nothing."""
+    access, secret, session = "AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "session-token-s3cr3t/+="
+    seen = []
+
+    class Service(http.server.BaseHTTPRequestHandler):
+        """Answers 200 to a request whose signature is the one AWS's algorithm gives for it, 403 otherwise."""
+
+        def verdict(self, body):
+            headers = {name.lower(): value for name, value in self.headers.items()}
+            auth = headers.get("authorization", "")
+            if not auth.startswith("AWS4-HMAC-SHA256 "):
+                return f"not a signature: {auth!r}"
+            fields = dict(part.strip().split("=", 1) for part in auth[len("AWS4-HMAC-SHA256 "):].split(","))
+            key_id, date, region, service, _ = fields["Credential"].split("/")
+            names = fields["SignedHeaders"].split(";")
+            stamp = headers.get("x-amz-date", "")
+            path, _, query = self.path.partition("?")
+            want = aws_signature(secret, self.command, headers["host"], path, query, headers, body, names, stamp, region, service)
+            seen.append({"names": names, "region": region, "service": service, "token": headers.get("x-amz-security-token"), "path": self.path, "body": body, "valid": want == fields["Signature"]})
+            if key_id != access or date != stamp[:8] or abs(time.time() - time.mktime(time.strptime(stamp, "%Y%m%dT%H%M%SZ")) + time.timezone) > 300:
+                return "wrong key or time"
+            return "" if want == fields["Signature"] else "the signature does not match"
+
+        def reply(self, body):
+            problem = self.verdict(body)
+            if self.command == "POST" and not problem:
+                answer = json.dumps({"choices": [{"message": {"role": "assistant", "content": "signed, and answered"}}]}).encode()
+            else:
+                answer = (problem or "ok").encode() + b"\n"
+            self.send_response(403 if problem else 200)
+            self.send_header("Content-Length", str(len(answer)))
+            self.end_headers()
+            self.wfile.write(answer)
+
+        def do_GET(self):
+            self.reply(b"")
+
+        def do_POST(self):
+            self.reply(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Service)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = server.server_address[1]
+    keys = {"AWS_ACCESS_KEY_ID": access, "AWS_SECRET_ACCESS_KEY": secret}
+    grant = f"aws:us-east-1:bedrock@127.0.0.1:{port}"
+    audit = project / "signed.jsonl"
+
+    got = n("run", "--sign", grant, "--audit", audit, wasm("fetch"), f"http://127.0.0.1:{port}/model/a%3A0/x%20y?b=2&a=1%2F2", env=keys)
+    check("a request to a signed destination is accepted by the service", got, 0, out="200 3 characters", absent=secret)
+    expect("it was signed over host and date, for the region and service named", seen[-1:] and seen[-1]["names"] == ["host", "x-amz-date"] and (seen[-1]["region"], seen[-1]["service"]) == ("us-east-1", "bedrock"), repr(seen[-1:]))
+    check("an unsigned request is refused by the service", n("run", "--allow-net", f"127.0.0.1:{port}", wasm("fetch"), f"http://127.0.0.1:{port}/"), 0, out="403")
+    replaced = n("run", "--sign", grant, "-e", "API_TOKEN=brought-from-elsewhere", wasm("fetch"), f"http://127.0.0.1:{port}/", env=keys)
+    check("the guest's own authorization is replaced by the signature", replaced, 0, out="200 3 characters")
+    temporary = n("run", "--sign", grant, wasm("fetch"), f"http://127.0.0.1:{port}/", env={**keys, "AWS_SESSION_TOKEN": session})
+    check("temporary credentials sign", temporary, 0, out="200 3 characters", absent=session)
+    expect("their session token is sent and signed", seen[-1]["token"] == session and "x-amz-security-token" in seen[-1]["names"], repr(seen[-1]))
+    check("the guest's environment holds no key", n("run", "--sign", grant, wasm("env"), env=keys), 0, out="(no environment)", absent=secret)
+    check("a signed destination is not opened to sockets", n("run", "--sign", grant, wasm("dial"), "127.0.0.1", port, env=keys), 1, err="permission denied")
+    check("a signed run needs the host's credentials", n("run", "--sign", grant, wasm("fetch"), f"http://127.0.0.1:{port}/"), 125, err="AWS_ACCESS_KEY_ID is not set")
+    check("a signed destination names a region and a service", n("run", "--sign", f"aws@127.0.0.1:{port}", wasm("env"), env=keys), 125, err="needs a region and a service")
+    check("only aws signs", n("run", "--sign", f"gcp:r:s@127.0.0.1:{port}", wasm("env"), env=keys), 125, err="the only signature nautra makes is aws")
+    text = audit.read_text()
+    records = [json.loads(line) for line in text.splitlines()]
+    expect("the audit says the request was signed, and holds no key or signature", [r.get("signed") for r in records] == ["aws"] and secret not in text and "Signature" not in text, text)
+
+    # An agent whose model wants signed requests: a body, a content type, and
+    # nothing in the agent's hands.
+    (project / "signed.toml").write_text(
+        f'[agent]\nimage = "{wasm("agent")}"\nsign = ["{grant}"]\n'
+        f'env = ["MODEL_URL=http://127.0.0.1:{port}/model/fixture/converse", "MODEL_NAME=fixture"]\n' + tools)
+    before = len(seen)
+    answered = n("run", "-f", project / "signed.toml", "say something", env=keys)
+    check("an agent's model call is signed, body and all", answered, 0, out="signed, and answered", absent=secret)
+    posted = seen[before:]
+    expect("the body and its content type are signed", len(posted) == 1 and posted[0]["valid"] and posted[0]["names"] == ["content-type", "host", "x-amz-date"] and b"say something" in posted[0]["body"], repr(posted))
+    record = project / "signed.record"
+    check("a signed run is recorded", n("run", "--record", record, "-f", "signed.toml", "say something", env=keys, cwd=project), 0, out="signed, and answered")
+    expect("the record holds no key and no signature", secret not in record.read_text() and "AWS4-HMAC-SHA256" not in record.read_text(), "the record holds one")
+    before = len(seen)
+    check("it replays with no credentials", n("replay", record, cwd=project), 0, out="signed, and answered")
+    expect("a replay asks the service nothing", len(seen) == before, f"{len(seen) - before} request(s)")
+    (project / "signed-native.toml").write_text(f'[agent]\nimage = "{wasm("hello")}"\n\n[tools.git]\ncommand = ["git", "status"]\nsign = ["{grant}"]\n')
+    check("a native tool cannot be signed for", n("run", "-f", project / "signed-native.toml", env=keys), 125, err="unknown key 'sign'")
+
+
 def record_checks(n, project, env, asked, token):
     """--record, replay and --resume: a run written down, re-run without the world, and continued."""
     record = project / "run.record"
@@ -700,6 +812,7 @@ mounts = ["ws:/work:ro"]
     record_checks(n, project, env, asked, token)
     team_checks(n, wasm, project, env, port, tools)
     invoke_checks(n, wasm, project, port, tools, token)
+    sign_checks(n, wasm, project, tools)
     native_checks(n, wasm, project)
     published_checks(n, wasm, project)
     platform_example_checks(n, wasm, work)

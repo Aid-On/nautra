@@ -1,0 +1,115 @@
+// SPDX-License-Identifier: Apache-2.0
+// Requests the host signs (ADR-0004).
+//
+// A destination granted with `--sign` gets every request signed on the way
+// out. The request is in the engine, which cannot call Almide, so nautra
+// starts itself once more (`nautra __sign`) and the engine asks that copy
+// over a pipe: one line of JSON for a request, one line back with the
+// headers to put on it.
+//
+// The copy is the only part of nautra that holds the credentials. It reads
+// them from the host's environment for each request, so the question it is
+// asked carries no key, and neither does the request document of a run.
+
+import datetime
+import env
+import io
+import json
+import secret
+import sigv4
+
+// The host variables AWS names its credentials by.
+let ACCESS_KEY = "AWS_ACCESS_KEY_ID"
+let SECRET_KEY = "AWS_SECRET_ACCESS_KEY"
+let SESSION_TOKEN = "AWS_SESSION_TOKEN"
+
+local effect fn credentials() -> sigv4.Credentials = {
+  let access = env.get(ACCESS_KEY) |> option.filter((v) => v != "") |> option.to_result("${ACCESS_KEY} is not set in the environment")!
+  let held = env.secret(SECRET_KEY)! |> option.filter((v) => secret.reveal(v) != "") |> option.to_result("${SECRET_KEY} is not set in the environment")!
+  let token = env.secret(SESSION_TOKEN)! |> option.filter((v) => secret.reveal(v) != "")
+  { access_key: access, secret_key: held, session_token: token }
+}
+
+// Whether the credentials a signed run needs are there, said before the run
+// starts rather than at its first request.
+effect fn ready() -> Unit = {
+  let _ = credentials()!
+  ()
+}
+
+local fn field(doc: Value, key: String) -> String! =
+  value.get(doc, key) |> option.to_result("the question has no ${key}")! |> value.as_string |> result.map_err((_) => "${key} is not a string")
+
+local fn pairs(doc: Value) -> List[(String, String)]! = {
+  let rows = value.get(doc, "headers") |> option.to_result("the question has no headers")! |> value.as_array |> result.map_err((_) => "headers is not a list")!
+  rows |> list.map((row) => {
+    let cells = value.as_array(row) |> result.map_err((_) => "a header is not a pair")!
+    let name = value.as_string(list.get(cells, 0) ?? value.null()) |> result.map_err((_) => "a header is not a pair")!
+    let text = value.as_string(list.get(cells, 1) ?? value.null()) |> result.map_err((_) => "a header is not a pair")!
+    (name, text)
+  })!
+}
+
+// One question answered: the headers that sign the request it describes.
+// `at` is the time the signature says it was made, in Unix seconds.
+fn answer(question: String, keys: sigv4.Credentials, at: Int) -> List[(String, String)]! = {
+  let doc = json.parse(question) |> result.map_err((_) => "the question is not JSON")!
+  let request: sigv4.Request = {
+    method: field(doc, "method")!,
+    host: field(doc, "host")!,
+    path: field(doc, "path")!,
+    query: field(doc, "query")!,
+    headers: pairs(doc)!,
+    body: bytes.new(),
+  }
+  let digest = field(doc, "body_sha256")!
+  sigv4.sign_payload(request, keys, field(doc, "region")!, field(doc, "service")!, at, digest).headers
+}
+
+local fn line(headers: Result[List[(String, String)], String]) -> String = match headers {
+  ok(rows) => json.stringify(value.object([("headers", value.array(rows |> list.map((row) => {
+    let (name, text) = row
+    value.array([value.string(name), value.string(text)])
+  })))])),
+  err(reason) => json.stringify(value.object([("error", value.string(reason))])),
+}
+
+local effect fn reply(question: String) -> List[(String, String)]! = {
+  let keys = credentials()!
+  answer(question, keys, datetime.now())
+}
+
+// `nautra __sign`: answers questions until its input ends, which is when the
+// nautra that started it does.
+effect fn run() -> Int = {
+  var more = true
+  while more {
+    match io.read_line() {
+      some(question) => println(line(reply(question))),
+      none => { more = false },
+    }
+  }
+  0
+}
+
+test "a question is answered with the headers AWS's own example gives" {
+  let keys: sigv4.Credentials = { access_key: "AKIDEXAMPLE", secret_key: secret.new("wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"), session_token: none }
+  let question = "{\"region\":\"us-east-1\",\"service\":\"iam\",\"method\":\"GET\",\"host\":\"iam.amazonaws.com\",\"path\":\"/\",\"query\":\"Action=ListUsers&Version=2010-05-08\",\"headers\":[[\"content-type\",\"application/x-www-form-urlencoded; charset=utf-8\"]],\"body_sha256\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}"
+  assert_eq(
+    answer(question, keys, datetime.from_parts(2015, 8, 30, 12, 36, 0) ?? 0),
+    ok([
+      ("x-amz-date", "20150830T123600Z"),
+      (
+        "authorization",
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/iam/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7",
+      )
+    ]),
+  )
+}
+
+test "a question that is not one is answered with the reason" {
+  let keys: sigv4.Credentials = { access_key: "A", secret_key: secret.new("s"), session_token: none }
+  assert(result.is_err(answer("not json", keys, 0)))
+  assert(result.is_err(answer("{\"method\":\"GET\"}", keys, 0)))
+  assert(string.starts_with(line(err("no")), "{\"error\""))
+}

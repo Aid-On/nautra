@@ -76,6 +76,15 @@ local fn secret_value(s: BoundSecret) -> Value = value.object([
   ("hosts", value.array(s.hosts |> list.map((rule) => value.object([("host", value.string(rule.host)), ("port", value.int(rule.port))])))),
 ])
 
+// A destination the engine has signed for. No key is here: the engine asks
+// nautra's signing copy (signer.almd), which finds the credentials itself.
+local fn sign_value(s: grants.SignGrant) -> Value = value.object([
+  ("scheme", value.string(s.scheme)),
+  ("region", value.string(s.region)),
+  ("service", value.string(s.service)),
+  ("hosts", value.array(s.hosts |> list.map((rule) => value.object([("host", value.string(rule.host)), ("port", value.int(rule.port))])))),
+])
+
 // The request document the engine applies. `argv` starts with the name the
 // guest sees itself run as; `env` is already resolved to name/value pairs.
 // This is the one place a secret's real value is written out, and it goes
@@ -83,6 +92,7 @@ local fn secret_value(s: BoundSecret) -> Value = value.object([
 fn request(path: String, argv: List[String], env: List[(String, String)], g: grants.Grants, secrets: List[BoundSecret]) -> Value =
   value.object([
     ("secrets", value.array(secrets |> list.map(secret_value))),
+    ("sign", value.array(g.signs |> list.map(sign_value))),
     ("audit", value.string(g.audit)),
     ("path", value.string(path)),
     ("args", value.array(argv |> list.map(value.string))),
