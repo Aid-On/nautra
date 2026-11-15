@@ -1,0 +1,112 @@
+// SPDX-License-Identifier: Apache-2.0
+// Every call into the native engine (native/engine.rs). Policy is decided on
+// this side; the engine receives one finished request and applies it.
+
+import http
+import json
+import self.grants
+
+@extern(rs, "engine", "nt_run")
+fn nt_run(request_json: String) -> String
+
+@extern(rs, "engine", "nt_inspect")
+fn nt_inspect(path: String) -> String
+
+@extern(rs, "engine", "nt_toml_to_json")
+fn nt_toml_to_json(text: String) -> String
+
+@extern(rs, "engine", "nt_http_upload")
+fn nt_http_upload(request_json: String) -> String
+
+// What a .wasm file is and which names it imports and exports.
+type Surface = { kind: String, imports: List[String], exports: List[String], size: Int }
+
+// How a run ended. `error` is empty when the guest chose its own exit.
+type Outcome = { exit_code: Int, error: String }
+
+local fn strings(doc: Value, key: String) -> List[String] =
+  (value.get_array(doc, key) ?? []) |> list.filter_map((item) => value.as_string(item)?)
+
+effect fn inspect(path: String) -> Surface = {
+  let doc = json.parse(nt_inspect(path))!
+  guard let message = value.get_string(doc, "error") else none => Surface {
+    kind: value.get_string(doc, "kind") ?? "module",
+    imports: strings(doc, "imports"),
+    exports: strings(doc, "exports"),
+    size: value.get_int(doc, "size") ?? 0,
+  }
+  err(message)!
+}
+
+effect fn toml(text: String) -> Value = {
+  let doc = json.parse(nt_toml_to_json(text))!
+  match value.get(doc, "ok") {
+    some(parsed) => parsed,
+    none => err(value.get_string(doc, "error") ?? "not TOML")!,
+  }
+}
+
+local fn mount_value(m: grants.Mount) -> Value =
+  value.object([("host", value.string(m.host)), ("guest", value.string(m.guest)), ("readonly", value.bool(m.readonly))])
+
+local fn net_value(g: grants.Grants) -> Value =
+  if g.net_all then value.object([("mode", value.string("all"))])
+  else if list.is_empty(g.net) then value.object([("mode", value.string("none"))])
+  else value.object([
+    ("mode", value.string("list")),
+    ("allow", value.array(g.net |> list.map((rule) => value.object([("host", value.string(rule.host)), ("port", value.int(rule.port))])))),
+  ])
+
+// The request document the engine applies. `argv` starts with the name the
+// guest sees itself run as; `env` is already resolved to name/value pairs.
+fn request(path: String, argv: List[String], env: List[(String, String)], g: grants.Grants) -> Value =
+  value.object([
+    ("path", value.string(path)),
+    ("args", value.array(argv |> list.map(value.string))),
+    ("env", value.array(env |> list.map(((name, v)) => value.array([value.string(name), value.string(v)])))),
+    ("mounts", value.array(g.mounts |> list.map(mount_value))),
+    ("net", net_value(g)),
+    ("memory_bytes", value.int(g.memory_bytes)),
+    ("timeout_ms", value.int(g.timeout_ms)),
+    ("fuel", value.int(g.fuel)),
+    ("stdin", value.bool(g.stdin)),
+  ])
+
+// Runs to completion on this process's stdout and stderr.
+effect fn run(req: Value) -> Outcome = {
+  let doc = json.parse(nt_run(json.stringify(req)))!
+  Outcome { exit_code: value.get_int(doc, "exit_code") ?? 125, error: value.get_string(doc, "error") ?? "" }
+}
+
+// One HTTP request with a file as its body, byte for byte. Almide 0.70's http
+// client carries request bodies as text, so binary uploads go through here.
+effect fn upload(method: String, target: String, headers: List[(String, String)], file: String) -> HttpResponse = {
+  let req = value.object([
+    ("method", value.string(method)),
+    ("url", value.string(target)),
+    ("headers", value.array(headers |> list.map(((name, v)) => value.array([value.string(name), value.string(v)])))),
+    ("path", value.string(file)),
+  ])
+  let doc = json.parse(nt_http_upload(json.stringify(req)))!
+  guard let status = value.get_int(doc, "status") else none => err(value.get_string(doc, "error") ?? "upload failed")!
+  let pairs = (value.get_array(doc, "headers") ?? []) |> list.filter_map((pair) => match value.as_array(pair) {
+    ok([name, v]) => some((value.as_string(name) ?? "", value.as_string(v) ?? "")),
+    _ => none,
+  })
+  http.with_headers(status, value.get_string(doc, "body") ?? "", pairs)
+}
+
+test "a request with no grants opens nothing" {
+  let req = request("/x/app.wasm", ["app"], [], grants.nothing())
+  assert_eq(value.get_array(req, "mounts"), some([]))
+  assert_eq(value.get_array(req, "env"), some([]))
+  assert_eq(value.get(req, "net"), some(value.object([("mode", value.string("none"))])))
+  assert_eq(value.get_bool(req, "stdin"), some(false))
+}
+
+test "network grants become a list, and * becomes all" {
+  let listed = { ...grants.nothing(), net: [grants.NetRule { host: "example.com", port: 443 }] }
+  assert_eq(value.get_string(net_value(listed), "mode"), some("list"))
+  let everything = { ...grants.nothing(), net_all: true, net: [grants.NetRule { host: "example.com", port: 443 }] }
+  assert_eq(value.get_string(net_value(everything), "mode"), some("all"))
+}

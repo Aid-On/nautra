@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
+// Keeps allocating: for trying --memory.
+fn main() -> Unit = {
+  var blocks: List[Bytes] = []
+  var held = 0
+  while true {
+    blocks = blocks + [bytes.zeros(1048576)]
+    held = held + 1
+    println("holding ${held} MiB")
+  }
+}

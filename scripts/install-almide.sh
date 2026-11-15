@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 set -euo pipefail
 # Exact published tag; move to v0.70.0 once the final release is published.
 tag="${ALMIDE_RELEASE_TAG:-v0.70.0-rc1}"

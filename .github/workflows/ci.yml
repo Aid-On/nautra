@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5057:5000
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust 1.97 or newer
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('almide.toml') }}
+      - name: Almide
+        run: bash scripts/install-almide.sh
+      - name: Check
+        run: .tools/almide/almide check src/main.almd
+      - name: Unit tests
+        run: .tools/almide/almide test
+      - name: Build
+        run: .tools/almide/almide build src/main.almd -o target/nautra
+      - name: Example guests
+        run: bash scripts/build-examples.sh
+      - name: Integration
+        run: python3 scripts/integration.py target/nautra
+        env:
+          NAUTRA_TEST_REGISTRY: localhost:5057

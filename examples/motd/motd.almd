@@ -1,0 +1,3 @@
+// SPDX-License-Identifier: Apache-2.0
+// Prints one line. Built with --component it is a WASI 0.2 component.
+fn main() -> Unit = println("the tide is in")

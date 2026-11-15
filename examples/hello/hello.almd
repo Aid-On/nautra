@@ -1,0 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+import env
+
+effect fn main() -> Unit = {
+  let name = list.get(env.args(), 0) ?? "world"
+  println("hello, ${name}")
+}

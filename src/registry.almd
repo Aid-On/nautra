@@ -1,0 +1,253 @@
+// SPDX-License-Identifier: Apache-2.0
+// Moving images to and from OCI registries (the OCI Distribution API).
+//
+// Nothing a registry returns is trusted by position: every blob is hashed and
+// compared with the digest that named it before it enters the store.
+
+import base64
+import env
+import http
+import json
+import secret
+import url
+import self.engine
+import self.oci
+import self.reference
+import self.store
+
+// One conversation with one repository. `token` is the Authorization value
+// the registry last accepted, empty until it asks for one.
+type Session = { base: String, origin: String, token: String }
+
+// Plain http only for a registry on this machine; everything else is https.
+fn origin_of(registry: String) -> String = {
+  let host = if string.starts_with(registry, "[") then string.take_while(registry, (c) => c != "]") + "]"
+    else string.take_while(registry, (c) => c != ":")
+  let local_host = host == "localhost" or host == "127.0.0.1" or host == "[::1]"
+  "${if local_host then "http" else "https"}://${registry}"
+}
+
+fn session(r: reference.Reference) -> Session! = {
+  guard r.registry != "" else err("'${reference.key(r)}' names no registry: write it as REGISTRY/NAME, for example ghcr.io/you/${r.repository}")
+  let origin = origin_of(r.registry)
+  Session { base: "${origin}/v2/${r.repository}", origin: origin, token: "" }
+}
+
+// The `key="value"` pairs of a WWW-Authenticate challenge. Values may hold
+// commas (a scope lists several actions), so this reads quote to quote.
+fn challenge_params(challenge: String) -> List[(String, String)] = {
+  var found: List[(String, String)] = []
+  var rest = challenge
+  while string.contains(rest, "=\"") {
+    let (before, after) = string.split_once(rest, "=\"") ?? ("", "")
+    let name = string.split(string.replace(before, ",", " "), " ") |> list.last ?? ""
+    let (text, tail) = string.split_once(after, "\"") ?? (after, "")
+    found = found + [(string.to_lower(name), text)]
+    rest = tail
+  }
+  found
+}
+
+// `Basic …` for the credentials in the environment, when there are any.
+local effect fn basic_credentials() -> String? = {
+  let user = env.get("NAUTRA_USERNAME") ?? ""
+  match env.secret("NAUTRA_PASSWORD")! {
+    some(password) if user != "" => some("Basic " + base64.encode(bytes.from_string("${user}:${secret.reveal(password)}"))),
+    _ => none,
+  }
+}
+
+local fn login_hint() -> String = "set NAUTRA_USERNAME and NAUTRA_PASSWORD (a registry token works as the password)"
+
+// Answers a 401: a bearer challenge is exchanged for a token at the realm it
+// names, a basic challenge is answered with the credentials directly.
+local effect fn authorize(challenge: String) -> String = {
+  let credentials = basic_credentials()!
+  if string.starts_with(string.to_lower(challenge), "basic") then {
+    credentials |> option.to_result("the registry asks for a login: ${login_hint()}")!
+  } else {
+    let params = challenge_params(challenge)
+    let lookup = (name: String) => (params |> list.find(((k, _)) => k == name) |> option.map(((_, v)) => v)) ?? ""
+    guard lookup("realm") != "" else err("the registry refused the request and named no way to authenticate")!
+    let query = url.build_query([("service", lookup("service")), ("scope", lookup("scope"))])
+    let headers = match credentials { some(c) => [("Authorization", c)], none => [] }
+    let resp = http.send(http.new_request("GET", "${lookup("realm")}?${query}", "", headers))!
+    guard http.status(resp) == 200 else err(if option.is_some(credentials) then "the registry rejected the login (${http.status(resp)})" else "the registry asks for a login: ${login_hint()}")!
+    let doc = json.parse(http.body(resp))!
+    let token = value.get_string(doc, "token") ?? value.get_string(doc, "access_token") ?? ""
+    guard token != "" else err("the registry's token service returned no token")!
+    "Bearer ${token}"
+  }
+}
+
+// `body_file` is the file to send as the request body, or "" for none. A
+// body goes through the engine's uploader, which sends it byte for byte.
+local effect fn exchange(token: String, method: String, target: String, headers: List[(String, String)], body_file: String) -> HttpResponse = {
+  let all = headers + (if token == "" then [] else [("Authorization", token)])
+  let unreachable = (e: String) => "cannot reach ${string.take_while(string.drop(target, 8), (c) => c != "/")}: ${e}"
+  if body_file == "" then http.send(http.new_request(method, target, "", all)) |> result.map_err(unreachable)!
+  else engine.upload(method, target, all, body_file) |> result.map_err(unreachable)!
+}
+
+// One request, answering an authentication challenge once.
+local effect fn send(mut s: Session, method: String, target: String, headers: List[(String, String)], body_file: String) -> HttpResponse = {
+  let first = exchange(s.token, method, target, headers, body_file)!
+  if http.status(first) != 401 then first else {
+    s.token = authorize(http.header(first, "www-authenticate") ?? "")!
+    exchange(s.token, method, target, headers, body_file)!
+  }
+}
+
+local fn is_redirect(status: Int) -> Bool = list.contains([301, 302, 303, 307, 308], status)
+
+local fn absolute(s: Session, location: String) -> String =
+  if string.starts_with(location, "/") then s.origin + location else location
+
+// A GET that follows redirects. A redirect leaves the registry for wherever
+// the blob is kept, and that place is not sent the registry's credentials.
+local effect fn fetch(mut s: Session, target: String, accept: List[String]) -> HttpResponse = {
+  let headers = accept |> list.map((media_type) => ("Accept", media_type))
+  var resp = send(s, "GET", target, headers, "")!
+  var hops = 0
+  while is_redirect(http.status(resp)) and hops < 5 {
+    let location = http.header(resp, "location") |> option.to_result("the registry redirected nowhere")!
+    resp = exchange("", "GET", absolute(s, location), headers, "")!
+    hops = hops + 1
+  }
+  resp
+}
+
+// The registry's own words for a failure, when it sent the standard error
+// document; kept short and stripped of control characters.
+local fn registry_says(resp: HttpResponse) -> String = {
+  let first = (json.parse(http.body(resp))? |> option.flat_map((doc) => value.get_array(doc, "errors")) |> option.flat_map(list.first))
+  let said = first |> option.map((e) => "${value.get_string(e, "code") ?? ""} ${value.get_string(e, "message") ?? ""}")
+  match said {
+    some(text) => " (${string.take(string.filter(string.trim(text), (c) => (string.to_codepoint(c) ?? 0) >= 32), 200)})",
+    none => "",
+  }
+}
+
+local fn refusal(resp: HttpResponse, what: String) -> String = match http.status(resp) {
+  401 | 403 => "${what}: access denied (${http.status(resp)}); ${login_hint()}",
+  404 => "${what}: not found",
+  code => "${what}: the registry answered ${code}${registry_says(resp)}",
+}
+
+// Downloads one blob and admits it only if it is the blob that was named.
+local effect fn pull_blob(mut s: Session, store_dir: String, d: oci.Descriptor) -> Unit = {
+  if not store.has_blob(store_dir, d.digest)! then {
+    let resp = fetch(s, "${s.base}/blobs/${d.digest}", [])!
+    guard http.status(resp) == 200 else err(refusal(resp, "blob ${d.digest}"))!
+    let data = http.body_bytes(resp)
+    guard store.digest_of(data) == d.digest else err("blob ${d.digest} arrived with different contents; refusing it")!
+    let _ = store.put_blob(store_dir, data)!
+  }
+}
+
+local let MANIFEST_TYPES = [oci.MANIFEST, oci.INDEX, oci.DOCKER_MANIFEST, oci.DOCKER_INDEX]
+
+local effect fn get_manifest(mut s: Session, selector: String) -> Bytes = {
+  let resp = fetch(s, "${s.base}/manifests/${selector}", MANIFEST_TYPES)!
+  guard http.status(resp) == 200 else err(refusal(resp, "manifest ${selector}"))!
+  let data = http.body_bytes(resp)
+  guard not reference.is_digest(selector) or store.digest_of(data) == selector else err("manifest ${selector} arrived with different contents; refusing it")!
+  data
+}
+
+// Of a multi-platform index, the entry for WebAssembly — or its only entry.
+fn pick(index: oci.Index) -> oci.Descriptor! = {
+  let architecture = (d: oci.Descriptor) => match d.platform { some(p) => value.get_string(p, "architecture") ?? "", none => "" }
+  match index.manifests |> list.find((d) => architecture(d) == "wasm") {
+    some(d) => d,
+    none => match index.manifests {
+      [only] => only,
+      _ => err("this image is published for ${index.manifests |> list.map(architecture) |> list.unique |> list.join(", ")}, not for WebAssembly"),
+    },
+  }
+}
+
+// Pulls an image into the store and returns its manifest.
+effect fn pull(store_dir: String, r: reference.Reference) -> oci.Descriptor = {
+  var s = session(r)!
+  let first = get_manifest(s, reference.selector(r))!
+  let first_doc = json.parse(bytes.to_string_lossy(first)) |> result.map_err((e) => "the registry sent a manifest that is not JSON: ${e}")!
+  let data = if option.is_some(value.get(first_doc, "manifests")) then {
+    let chosen = pick(oci.parse_index(bytes.to_string_lossy(first))!)!
+    get_manifest(s, chosen.digest)!
+  } else first
+  let manifest = oci.parse_manifest(bytes.to_string_lossy(data))!
+  guard option.is_some(oci.wasm_layer(manifest)) else err("${reference.key(r)} is not a WebAssembly image: it has no ${oci.WASM_LAYER} layer (nautra runs Wasm, not Linux containers)")!
+  for blob in [manifest.config] + manifest.layers {
+    pull_blob(s, store_dir, blob)!
+  }
+  let stored = store.put(store_dir, manifest.mediaType ?? oci.MANIFEST, data)!
+  store.set_ref(store_dir, reference.key(r), stored)!
+  stored
+}
+
+local effect fn push_blob(mut s: Session, store_dir: String, d: oci.Descriptor) -> Bool = {
+  let present = send(s, "HEAD", "${s.base}/blobs/${d.digest}", [], "")!
+  if http.status(present) == 200 then false else {
+    let begun = send(s, "POST", "${s.base}/blobs/uploads/", [("Content-Length", "0")], "")!
+    guard http.status(begun) == 202 else err(refusal(begun, "starting an upload"))!
+    let location = absolute(s, http.header(begun, "location") |> option.to_result("the registry started an upload and named no place for it")!)
+    let target = "${location}${if string.contains(location, "?") then "&" else "?"}digest=${url.encode_component(d.digest)}"
+    // Reading the blob first checks it against its digest before it leaves.
+    let _ = store.read_blob(store_dir, d.digest)!
+    let done = send(s, "PUT", target, [("Content-Type", "application/octet-stream")], store.blob_path(store_dir, d.digest))!
+    guard http.status(done) == 201 else err(refusal(done, "uploading blob ${d.digest}"))!
+    true
+  }
+}
+
+// Pushes a stored image. Returns how many blobs had to be uploaded.
+effect fn push(store_dir: String, r: reference.Reference) -> Int = {
+  var s = session(r)!
+  let stored = store.resolve(store_dir, reference.key(r))! |> option.to_result("no image named ${reference.key(r)} in the store; `nautra tag` an existing one to that name first")!
+  let data = store.read_blob(store_dir, stored.digest)!
+  let manifest = oci.parse_manifest(bytes.to_string_lossy(data))!
+  var uploaded = 0
+  for blob in [manifest.config] + manifest.layers {
+    if push_blob(s, store_dir, blob)! then {
+      uploaded = uploaded + 1
+    }
+  }
+  let done = send(s, "PUT", "${s.base}/manifests/${reference.selector(r)}", [("Content-Type", manifest.mediaType ?? oci.MANIFEST)], store.blob_path(store_dir, stored.digest))!
+  guard http.status(done) == 201 else err(refusal(done, "publishing the manifest"))!
+  uploaded
+}
+
+test "only a registry on this machine is spoken to in plain http" {
+  assert_eq(origin_of("localhost:5000"), "http://localhost:5000")
+  assert_eq(origin_of("127.0.0.1:5000"), "http://127.0.0.1:5000")
+  assert_eq(origin_of("ghcr.io"), "https://ghcr.io")
+  assert_eq(origin_of("localhost.example.com"), "https://localhost.example.com")
+  assert_eq(origin_of("registry.example.com:5000"), "https://registry.example.com:5000")
+}
+
+test "a challenge is read quote to quote" {
+  let params = challenge_params("Bearer realm=\"https://ghcr.io/token\",service=\"ghcr.io\",scope=\"repository:a/b:pull,push\"")
+  assert_eq(params, [("realm", "https://ghcr.io/token"), ("service", "ghcr.io"), ("scope", "repository:a/b:pull,push")])
+  assert_eq(challenge_params("Basic"), [])
+}
+
+test "a local name cannot be pushed or pulled" {
+  assert(result.is_err(session(reference.parse("hello:v1")!)))
+  assert_eq(session(reference.parse("localhost:5000/team/app:v1")!)!.base, "http://localhost:5000/v2/team/app")
+}
+
+test "an index yields its wasm entry" {
+  let entry = (arch: String, digest: String) => oci.Descriptor {
+    mediaType: oci.MANIFEST,
+    digest: digest,
+    size: 1,
+    platform: some(value.object([("architecture", value.string(arch)), ("os", value.string("x"))])),
+  }
+  let mixed = oci.Index { schemaVersion: 2, manifests: [entry("amd64", "sha256:a"), entry("wasm", "sha256:w")] }
+  assert_eq(pick(mixed)!.digest, "sha256:w")
+  let linux = oci.Index { schemaVersion: 2, manifests: [entry("amd64", "sha256:a"), entry("arm64", "sha256:b")] }
+  assert(result.is_err(pick(linux)))
+  let single = oci.Index { schemaVersion: 2, manifests: [entry("", "sha256:s")] }
+  assert_eq(pick(single)!.digest, "sha256:s")
+}

@@ -1,0 +1,222 @@
+// SPDX-License-Identifier: Apache-2.0
+// Images: a Wasm binary, the standard config that describes it, and what its
+// author says a run needs.
+//
+// The author's part travels as one annotation (`dev.nautra.config`). It is a
+// statement, not a permission: `wants` tells the person running the image
+// which grants to consider, and never opens anything by itself.
+
+import fs
+import json
+import self.engine
+import self.grants
+import self.oci
+import self.store
+
+type EnvVar: Codec = { name: String, value: String }
+
+// Guest directories, `host:port` destinations and variable names the
+// workload expects to be granted.
+type Wants: Codec = { mounts: List[String], net: List[String], env: List[String] }
+
+type Config: Codec = { args: List[String], env: List[EnvVar], wants: Wants }
+
+// A Nautrafile, read: which binary to package and the config to attach.
+type Recipe = { wasm: String, description: String, config: Config }
+
+fn empty() -> Config = Config { args: [], env: [], wants: Wants { mounts: [], net: [], env: [] } }
+
+local fn string_list(table: Value, key: String, where: String) -> List[String]! = match value.get(table, key) {
+  none => [],
+  some(v) => {
+    let items = value.as_array(v) |> result.map_err((_) => "${where}${key} must be a list of strings")!
+    items |> list.map((item) => value.as_string(item) |> result.map_err((_) => "${where}${key} must be a list of strings")!)!
+  },
+}
+
+local fn only_keys(table: Value, allowed: List[String], where: String) -> Unit! = {
+  let keys = (value.as_object(table) |> result.map_err((_) => "${where} must be a table")!) |> list.map(((k, _)) => k)
+  match keys |> list.find((k) => not list.contains(allowed, k)) {
+    some(k) => err("unknown key '${k}' in ${where}; expected one of: ${list.join(allowed, ", ")}"),
+    none => (),
+  }
+}
+
+local fn env_table(run: Value) -> List[EnvVar]! = match value.get(run, "env") {
+  none => [],
+  some(table) => {
+    let entries = value.as_object(table) |> result.map_err((_) => "[run.env] must be a table of strings")!
+    entries |> list.map(((name, v)) => EnvVar {
+      name: name,
+      value: value.as_string(v) |> result.map_err((_) => "[run.env] ${name} must be a string")!,
+    })!
+  },
+}
+
+local fn wants_from(doc: Value) -> Wants! = match value.get(doc, "wants") {
+  none => Wants { mounts: [], net: [], env: [] },
+  some(table) => {
+    only_keys(table, ["mounts", "net", "env"], "[wants]")!
+    let mounts = string_list(table, "mounts", "[wants] ")!
+    let net = string_list(table, "net", "[wants] ")!
+    for dir in mounts {
+      guard string.starts_with(dir, "/") else err("[wants] mounts: '${dir}' must be an absolute guest path")
+    }
+    for destination in net {
+      let _ = grants.parse_net(destination) |> result.map_err((e) => "[wants] net: ${e}")!
+    }
+    Wants { mounts: mounts, net: net, env: string_list(table, "env", "[wants] ")! }
+  },
+}
+
+// Reads a parsed Nautrafile. A key nautra does not know is an error, so a
+// typo cannot silently drop a setting.
+fn recipe(doc: Value) -> Recipe! = {
+  only_keys(doc, ["wasm", "description", "run", "wants"], "the Nautrafile")!
+  let wasm = value.get_string(doc, "wasm") |> option.to_result("the Nautrafile needs `wasm = \"path/to/app.wasm\"`")!
+  let run = value.get(doc, "run") ?? value.object([])
+  only_keys(run, ["args", "env"], "[run]")!
+  Recipe {
+    wasm: wasm,
+    description: value.get_string(doc, "description") ?? "",
+    config: Config { args: string_list(run, "args", "[run] ")!, env: env_table(run)!, wants: wants_from(doc)! },
+  }
+}
+
+local fn config_blob(surface: engine.Surface, layer: oci.Descriptor, created: String) -> Value = {
+  let names = (xs: List[String]) => value.array(xs |> list.map(value.string))
+  let common = [
+    ("created", value.string(created)),
+    ("architecture", value.string("wasm")),
+    ("os", value.string(if surface.kind == "component" then "wasip2" else "wasip1")),
+    ("layerDigests", names([layer.digest])),
+  ]
+  let component = [("component", value.object([("exports", names(surface.exports)), ("imports", names(surface.imports))]))]
+  value.object(if surface.kind == "component" then common + component else common)
+}
+
+// Packages one Wasm binary into the store and returns its manifest.
+effect fn build(store_dir: String, wasm_path: String, r: Recipe, created: String) -> oci.Descriptor = {
+  let surface = engine.inspect(wasm_path)!
+  let layer = store.put(store_dir, oci.WASM_LAYER, fs.read_bytes(wasm_path)!)!
+  let config = store.put(store_dir, oci.WASM_CONFIG, bytes.from_string(json.stringify(config_blob(surface, layer, created))))!
+  let described = if r.description == "" then [] else [(oci.DESCRIPTION, value.string(r.description))]
+  let manifest = oci.Manifest {
+    schemaVersion: 2,
+    mediaType: some(oci.MANIFEST),
+    config: config,
+    layers: [layer],
+    annotations: some(value.object([
+      (oci.CREATED, value.string(created)),
+      (oci.NAUTRA_CONFIG, value.string(json.stringify(Config.encode(r.config)))),
+    ] + described)),
+  }
+  store.put(store_dir, oci.MANIFEST, bytes.from_string(json.stringify(oci.Manifest.encode(manifest))))!
+}
+
+// The author's config of an image. An image from elsewhere may carry none,
+// or one that does not parse; either way it then asks for nothing.
+fn config_of(m: oci.Manifest) -> Config = match oci.annotation(m.annotations, oci.NAUTRA_CONFIG) {
+  some(text) => (json.parse(text)? |> option.flat_map((doc) => Config.decode(doc)?)) ?? empty(),
+  none => empty(),
+}
+
+// Text from an image is someone else's: keep it from steering the terminal.
+fn printable(s: String) -> String = string.filter(s, (c) => {
+  let code = string.to_codepoint(c) ?? 0
+  code >= 32 and code != 127
+})
+
+local fn admits(g: grants.Grants, destination: String) -> Bool = match grants.parse_net(destination) {
+  err(_) => true,
+  ok(want) => g.net_all or list.any(g.net, (rule) =>
+    (rule.host == "*" or rule.host == want.host) and (rule.port == 0 or rule.port == want.port)),
+}
+
+// The grants an image asks for that this run does not give, each spelled as
+// the option that would give it.
+fn ungranted(c: Config, g: grants.Grants) -> List[String] = {
+  let mounts = c.wants.mounts
+    |> list.filter((dir) => not list.any(g.mounts, (m) => m.guest == dir))
+    |> list.map((dir) => "-v <dir>:${printable(dir)}")
+  let net = c.wants.net
+    |> list.filter((destination) => not admits(g, destination))
+    |> list.map((destination) => "--allow-net ${printable(destination)}")
+  let env = c.wants.env
+    |> list.filter((name) => not list.any(g.env, (e) => e.name == name) and not list.any(c.env, (e) => e.name == name))
+    |> list.map((name) => "-e ${printable(name)}")
+  mounts + net + env
+}
+
+// The host interfaces a binary imports, by family: the outer bound of what
+// it can ever ask for, whatever it is granted.
+fn reach(imports: List[String]) -> List[String] = {
+  let families = [
+    ("files", ["wasi:filesystem/", "wasi_snapshot_preview1.path_", "wasi_snapshot_preview1.fd_prestat"]),
+    ("sockets", ["wasi:sockets/", "wasi_snapshot_preview1.sock_"]),
+    ("http", ["wasi:http/"]),
+    ("environment", ["wasi:cli/environment", "wasi_snapshot_preview1.environ_"]),
+    ("clocks", ["wasi:clocks/", "wasi_snapshot_preview1.clock_"]),
+    ("random", ["wasi:random/", "wasi_snapshot_preview1.random_"]),
+  ]
+  families
+    |> list.filter(((_, prefixes)) => list.any(imports, (name) => list.any(prefixes, (p) => string.starts_with(name, p))))
+    |> list.map(((family, _)) => family)
+}
+
+test "a Nautrafile becomes a recipe" {
+  let doc = value.object([
+    ("wasm", value.string("app.wasm")),
+    ("run", value.object([
+      ("args", value.array([value.string("--port"), value.string("8080")])),
+      ("env", value.object([("LOG", value.string("info"))])),
+    ])),
+    ("wants", value.object([("mounts", value.array([value.string("/data")])), ("net", value.array([value.string("api.example.com:443")]))])),
+  ])
+  let r = recipe(doc)!
+  assert_eq(r.wasm, "app.wasm")
+  assert_eq(r.config.args, ["--port", "8080"])
+  assert_eq(r.config.env, [EnvVar { name: "LOG", value: "info" }])
+  assert_eq(r.config.wants.mounts, ["/data"])
+  assert_eq(r.config.wants.env, [])
+}
+
+test "a Nautrafile typo is an error" {
+  assert(result.is_err(recipe(value.object([("wasm", value.string("a.wasm")), ("wnats", value.object([]))]))))
+  assert(result.is_err(recipe(value.object([("run", value.object([]))]))))
+  assert(result.is_err(recipe(value.object([("wasm", value.string("a.wasm")), ("wants", value.object([("mounts", value.array([value.string("data")]))]))]))))
+}
+
+test "the config roundtrips through a manifest annotation" {
+  let c = Config { args: ["x"], env: [EnvVar { name: "A", value: "1" }], wants: Wants { mounts: ["/d"], net: [], env: ["T"] } }
+  let layer = oci.Descriptor { mediaType: oci.WASM_LAYER, digest: "sha256:aa", size: 1 }
+  let m = oci.Manifest {
+    schemaVersion: 2,
+    config: layer,
+    layers: [layer],
+    annotations: some(value.object([(oci.NAUTRA_CONFIG, value.string(json.stringify(Config.encode(c))))])),
+  }
+  assert_eq(config_of(m), c)
+  assert_eq(config_of({ ...m, annotations: none }), empty())
+  assert_eq(config_of({ ...m, annotations: some(value.object([(oci.NAUTRA_CONFIG, value.string("{not json"))])) }), empty())
+}
+
+test "what an image wants and was not given is named as an option" {
+  let c = { ...empty(), wants: Wants { mounts: ["/data", "/cache"], net: ["api.example.com:443", "db:5432"], env: ["TOKEN"] } }
+  let g = {
+    ...grants.nothing(),
+    mounts: [grants.Mount { host: ".", guest: "/data", readonly: false }],
+    net: [grants.NetRule { host: "*", port: 443 }],
+  }
+  assert_eq(ungranted(c, g), ["-v <dir>:/cache", "--allow-net db:5432", "-e TOKEN"])
+  assert_eq(ungranted(c, { ...g, net_all: true, env: [grants.EnvGrant { name: "TOKEN", value: none }] }), ["-v <dir>:/cache"])
+}
+
+test "text from an image cannot carry control characters" {
+  assert_eq(printable("ok\x1b[2Jfine\n"), "ok[2Jfine")
+}
+
+test "reach is read from imports" {
+  assert_eq(reach(["wasi_snapshot_preview1.fd_write", "wasi_snapshot_preview1.proc_exit"]), [])
+  assert_eq(reach(["wasi:filesystem/types@0.2.0", "wasi:sockets/tcp@0.2.0", "wasi:cli/environment@0.2.0"]), ["files", "sockets", "environment"])
+}

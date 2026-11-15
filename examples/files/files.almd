@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+// Reads one file and writes another: needs a directory granted with -v.
+import env
+import fs
+
+effect fn main() -> Unit = {
+  let args = env.args()
+  let source = list.get(args, 0) ?? "/data/in.txt"
+  let target = list.get(args, 1) ?? "/data/out.txt"
+  let text = fs.read_text(source)!
+  fs.write_text(target, string.to_upper(text))!
+  println("copied ${string.len(text)} characters from ${source} to ${target}")
+}

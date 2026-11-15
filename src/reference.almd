@@ -1,0 +1,116 @@
+// SPDX-License-Identifier: Apache-2.0
+// Image references: `[registry/]repository[:tag][@digest]`.
+//
+// A name with no registry is local only: nautra never guesses a default
+// registry, so `pull hello` cannot reach somewhere the user did not name.
+
+type Reference = { registry: String, repository: String, tag: String, digest: String }
+
+fn is_hex(s: String) -> Bool =
+  string.to_list(s) |> list.all((c) => string.is_digit(c) or string.contains("abcdef", c))
+
+fn is_digest(s: String) -> Bool = match string.strip_prefix(s, "sha256:") {
+  some(hex) => string.len(hex) == 64 and is_hex(hex),
+  none => false,
+}
+
+// The first path component names a registry when it looks like a host:
+// `localhost`, or anything with a dot or a port.
+local fn is_registry(part: String) -> Bool =
+  part == "localhost" or string.contains(part, ".") or string.contains(part, ":")
+
+local fn is_name_char(c: String) -> Bool =
+  string.is_digit(c) or (string.is_alpha(c) and string.is_lower(c) and string.byte_len(c) == 1) or string.contains("._-/", c)
+
+local fn is_tag_char(c: String) -> Bool =
+  (string.is_alphanumeric(c) and string.byte_len(c) == 1) or string.contains("._-", c)
+
+local fn is_valid_repository(repository: String) -> Bool =
+  not string.is_empty(repository)
+    and string.to_list(repository) |> list.all(is_name_char)
+    and string.split(repository, "/") |> list.all((part) => not string.is_empty(part))
+
+local fn is_valid_tag(tag: String) -> Bool =
+  string.len(tag) <= 128 and string.to_list(tag) |> list.all(is_tag_char)
+
+fn parse(text: String) -> Reference! = {
+  guard not string.is_empty(text) else err("an image reference is empty")
+  let (named, digest) = match string.split_once(text, "@") {
+    some((name, d)) => (name, d),
+    none => (text, ""),
+  }
+  guard digest == "" or is_digest(digest) else err("'${digest}' is not a sha256 digest")
+  // A colon after the last slash starts the tag; one before it is a port.
+  let (path, tag) = match string.last_index_of(named, ":") {
+    some(i) if not string.contains(string.drop(named, i + 1), "/") => (string.take(named, i), string.drop(named, i + 1)),
+    _ => (named, ""),
+  }
+  let (registry, repository) = match string.split_once(path, "/") {
+    some((head, rest)) if is_registry(head) => (head, rest),
+    _ => ("", path),
+  }
+  guard is_valid_repository(repository) else err("'${text}' is not an image name: use lowercase letters, digits, '.', '_', '-' and '/'")
+  guard is_valid_tag(tag) else err("'${tag}' is not a tag")
+  Reference {
+    registry: registry,
+    repository: repository,
+    tag: if tag == "" and digest == "" then "latest" else tag,
+    digest: digest,
+  }
+}
+
+// `registry/repository`, or just the repository for a local name.
+fn name(r: Reference) -> String =
+  if r.registry == "" then r.repository else "${r.registry}/${r.repository}"
+
+// The name an image is stored under. A digest pins harder than a tag, so a
+// reference carrying both is kept by its digest.
+fn key(r: Reference) -> String =
+  if r.digest != "" then "${name(r)}@${r.digest}" else "${name(r)}:${r.tag}"
+
+// What a registry is asked for: the digest when there is one, else the tag.
+fn selector(r: Reference) -> String = if r.digest != "" then r.digest else r.tag
+
+test "a bare name is local and gets latest" {
+  let r = parse("hello")!
+  assert_eq(r.registry, "")
+  assert_eq(r.repository, "hello")
+  assert_eq(r.tag, "latest")
+  assert_eq(key(r), "hello:latest")
+}
+
+test "a host with a port keeps its port" {
+  let r = parse("localhost:5000/team/app:v1")!
+  assert_eq(r.registry, "localhost:5000")
+  assert_eq(r.repository, "team/app")
+  assert_eq(r.tag, "v1")
+}
+
+test "a port without a tag is not a tag" {
+  let r = parse("localhost:5000/app")!
+  assert_eq(r.registry, "localhost:5000")
+  assert_eq(r.tag, "latest")
+}
+
+test "a digest pins and drops the default tag" {
+  let digest = "sha256:" + string.repeat("ab", 32)
+  let r = parse("ghcr.io/aid-on/app@${digest}")!
+  assert_eq(r.registry, "ghcr.io")
+  assert_eq(r.tag, "")
+  assert_eq(selector(r), digest)
+  assert_eq(key(r), "ghcr.io/aid-on/app@${digest}")
+}
+
+test "a first component without a dot is part of the repository" {
+  let r = parse("team/app:v2")!
+  assert_eq(r.registry, "")
+  assert_eq(r.repository, "team/app")
+}
+
+test "bad references are refused" {
+  assert(result.is_err(parse("")))
+  assert(result.is_err(parse("Hello")))
+  assert(result.is_err(parse("app@sha256:beef")))
+  assert(result.is_err(parse("app:bad tag")))
+  assert(result.is_err(parse("ghcr.io//app")))
+}

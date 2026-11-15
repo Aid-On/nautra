@@ -1,0 +1,319 @@
+// SPDX-License-Identifier: Apache-2.0
+// The nautra command line: dispatch, and one function per command.
+
+import env
+import fs
+import json
+import path
+import process
+import self.engine
+import self.grants
+import self.help
+import self.image
+import self.oci
+import self.reference
+import self.registry
+import self.store
+
+// A workload ready to run: the binary on disk, the name it sees itself run
+// as, and what its image says about running it.
+type Target = { path: String, name: String, config: image.Config }
+
+fn human_size(n: Int) -> String = {
+  let tenths = (unit: Int) => {
+    let scaled = n * 10 / unit
+    "${scaled / 10}.${scaled % 10}"
+  }
+  if n < 1000 then "${n} B"
+  else if n < 1000000 then "${tenths(1000)} kB"
+  else if n < 1000000000 then "${tenths(1000000)} MB"
+  else "${tenths(1000000000)} GB"
+}
+
+fn short(digest: String) -> String = string.take(string.strip_prefix(digest, "sha256:") ?? digest, 12)
+
+// Rows as aligned columns, two spaces apart.
+fn table(rows: List[List[String]]) -> String = {
+  let columns = rows |> list.map((row) => list.len(row)) |> list.max ?? 0
+  let widths = list.range(0, columns) |> list.map((c) => rows |> list.map((row) => string.len(list.get(row, c) ?? "")) |> list.max ?? 0)
+  rows
+    |> list.map((row) => list.zip_with(row, widths, (cell, width) => string.pad_end(cell, width, " ")) |> list.join("  ") |> string.trim_end)
+    |> list.join("\n")
+}
+
+local fn kind_of(config: Value) -> String = match value.get_string(config, "os") ?? "" {
+  "wasip1" => "module",
+  "wasip2" => "component",
+  _ => "wasm",
+}
+
+// The standard config blob of an image, or an empty object when it has none
+// that parses.
+local effect fn config_doc(store_dir: String, m: oci.Manifest) -> Value =
+  (store.read_blob(store_dir, m.config.digest)? |> option.flat_map((data) => json.parse(bytes.to_string_lossy(data))?)) ?? value.object([])
+
+local effect fn pull_into(store_dir: String, r: reference.Reference) -> oci.Descriptor = {
+  eprintln("pulling ${reference.key(r)}")
+  registry.pull(store_dir, r)!
+}
+
+// Finds what `run` was pointed at: a .wasm file as it is, or an image from
+// the store, pulled first when it names a registry and is not stored yet.
+local effect fn locate(text: String) -> Target = {
+  if fs.is_file(text) then Target { path: text, name: path.basename(text), config: image.empty() } else {
+    let r = reference.parse(text) |> result.map_err((e) => "no file named '${text}', and ${e}")!
+    let store_dir = store.open()!
+    let stored = match store.resolve(store_dir, reference.key(r))! {
+      some(d) => d,
+      none => {
+        guard r.registry != "" else err("no image named ${reference.key(r)}: build it with `nautra build -t ${reference.key(r)}`, or name a registry to pull from")!
+        pull_into(store_dir, r)!
+      },
+    }
+    let manifest = store.read_manifest(store_dir, stored.digest)!
+    let layer = oci.wasm_layer(manifest) |> option.to_result("${reference.key(r)} has no WebAssembly layer to run")!
+    // Reading the blob checks it against its digest before it is run.
+    let _ = store.read_blob(store_dir, layer.digest)!
+    Target {
+      path: store.blob_path(store_dir, layer.digest),
+      name: path.basename(r.repository),
+      config: image.config_of(manifest),
+    }
+  }
+}
+
+// The guest's environment: the image's own variables, then the run's, a
+// later one replacing an earlier one of the same name. A bare `-e NAME` the
+// host does not have is left out.
+local effect fn environment(config: image.Config, wanted: List[grants.EnvGrant]) -> List[(String, String)] = {
+  var pairs: List[(String, String)] = config.env |> list.map((e) => (e.name, e.value))
+  for grant in wanted {
+    match option.or_else(grant.value, () => env.get(grant.name)) {
+      some(v) => { pairs = (pairs |> list.filter(((name, _)) => name != grant.name)) + [(grant.name, v)] },
+      none => (),
+    }
+  }
+  pairs
+}
+
+local effect fn cmd_run(args: List[String]) -> Int = {
+  let line = grants.parse_run(args)!
+  for mount in line.grants.mounts {
+    guard fs.is_dir(mount.host) else err("cannot mount '${mount.host}': it is not a directory")!
+  }
+  let target = locate(line.image)!
+  let argv = [target.name] + (if list.is_empty(line.args) then target.config.args else line.args)
+  let missing = image.ungranted(target.config, line.grants)
+  if not list.is_empty(missing) then {
+    eprintln("nautra: this image asks for grants this run does not give: ${list.join(missing, "  ")}")
+  }
+  let request = engine.request(target.path, argv, environment(target.config, line.grants.env)!, line.grants)
+  let outcome = engine.run(request)!
+  if outcome.error != "" then {
+    eprintln("nautra: ${outcome.error}")
+  }
+  outcome.exit_code
+}
+
+type BuildLine = { tags: List[String], file: String, context: String }
+
+local fn parse_build(args: List[String]) -> BuildLine! = {
+  var line = BuildLine { tags: [], file: "", context: "" }
+  var i = 0
+  while i < list.len(args) {
+    let arg = list.get(args, i) ?? ""
+    i = i + 1
+    if arg == "-t" or arg == "--tag" or arg == "-f" or arg == "--file" then {
+      let text = list.get(args, i) |> option.to_result("${arg} needs a value")!
+      i = i + 1
+      line = if string.starts_with(arg, "-t") or arg == "--tag" then { ...line, tags: line.tags + [text] } else { ...line, file: text }
+    } else if string.starts_with(arg, "-") then {
+      err("unknown option '${arg}'")!
+    } else {
+      guard line.context == "" else err("build takes one path, got '${line.context}' and '${arg}'")
+      line = { ...line, context: arg }
+    }
+  }
+  line
+}
+
+// The moment recorded in an image. SOURCE_DATE_EPOCH pins it, so the same
+// inputs give the same digest.
+local effect fn created_now() -> String = match env.get("SOURCE_DATE_EPOCH") {
+  some(text) => datetime.to_iso(int.parse(text) |> result.map_err((_) => "SOURCE_DATE_EPOCH is not a number of seconds")!),
+  none => datetime.to_iso(datetime.now()),
+}
+
+local effect fn cmd_build(args: List[String]) -> Int = {
+  let line = parse_build(args)!
+  let context = if line.context == "" then "." else line.context
+  let names = line.tags |> list.map((t) => reference.parse(t)!)!
+  let (wasm_path, r) = if line.file == "" and fs.is_file(context) then {
+    (context, image.Recipe { wasm: context, description: "", config: image.empty() })
+  } else {
+    let file = if line.file != "" then line.file else path.join(context, "Nautrafile")
+    let text = fs.read_text(file) |> result.map_err((e) => "cannot read ${file}: ${e}")!
+    let parsed = image.recipe(engine.toml(text) |> result.map_err((e) => "${file}: ${e}")!) |> result.map_err((e) => "${file}: ${e}")!
+    (if path.is_absolute(parsed.wasm) then parsed.wasm else path.join(path.dirname(file), parsed.wasm), parsed)
+  }
+  let store_dir = store.open()!
+  let manifest = image.build(store_dir, wasm_path, r, created_now()!)!
+  for n in names {
+    store.set_ref(store_dir, reference.key(n), manifest)!
+    println("${reference.key(n)}  ${manifest.digest}")
+  }
+  if list.is_empty(names) then {
+    println(manifest.digest)
+  }
+  0
+}
+
+local effect fn cmd_images() -> Int = {
+  let store_dir = store.open()!
+  var rows = [["NAME", "DIGEST", "KIND", "SIZE", "CREATED"]]
+  for (name, d) in store.list_refs(store_dir)! |> list.sort_by(((n, _)) => n) {
+    let row = match store.read_manifest(store_dir, d.digest) {
+      ok(m) => {
+        let size = oci.wasm_layer(m) |> option.map((layer) => human_size(layer.size))
+        [name, short(d.digest), kind_of(config_doc(store_dir, m)!), size ?? "-", image.printable(oci.annotation(m.annotations, oci.CREATED) ?? "-")]
+      },
+      err(_) => [name, short(d.digest), "damaged", "-", "-"],
+    }
+    rows = rows + [row]
+  }
+  println(table(rows))
+  0
+}
+
+local fn listed(label: String, items: List[String]) -> List[String] =
+  if list.is_empty(items) then [] else ["${label}${list.join(items |> list.map(image.printable), ", ")}"]
+
+local fn surface_lines(kind: String, size: Int, imports: List[String]) -> List[String] = {
+  let reach = image.reach(imports)
+  [
+    "kind      ${kind}",
+    "size      ${human_size(size)}",
+    "reach     ${if list.is_empty(reach) then "nothing beyond stdio and exit" else list.join(reach, ", ")}",
+  ]
+}
+
+local effect fn cmd_inspect(args: List[String]) -> Int = {
+  let text = list.get(args, 0) |> option.to_result("inspect needs an image or a .wasm file")!
+  if fs.is_file(text) then {
+    let surface = engine.inspect(text)!
+    println((["file      ${text}"] + surface_lines(surface.kind, surface.size, surface.imports)) |> list.join("\n"))
+  } else {
+    let r = reference.parse(text) |> result.map_err((e) => "no file named '${text}', and ${e}")!
+    let store_dir = store.open()!
+    let stored = store.resolve(store_dir, reference.key(r))! |> option.to_result("no image named ${reference.key(r)}")!
+    let m = store.read_manifest(store_dir, stored.digest)!
+    let layer = oci.wasm_layer(m) |> option.to_result("${reference.key(r)} has no WebAssembly layer")!
+    let surface = engine.inspect(store.blob_path(store_dir, layer.digest))!
+    let config = image.config_of(m)
+    let wants = (config.wants.mounts |> list.map((dir) => "-v <dir>:${dir}"))
+      + (config.wants.net |> list.map((destination) => "--allow-net ${destination}"))
+      + (config.wants.env |> list.map((name) => "-e ${name}"))
+    let lines = ["name      ${reference.key(r)}", "digest    ${stored.digest}", "wasm      ${layer.digest}"]
+      + surface_lines(surface.kind, surface.size, surface.imports)
+      + listed("created   ", option.to_list(oci.annotation(m.annotations, oci.CREATED)))
+      + listed("about     ", option.to_list(oci.annotation(m.annotations, oci.DESCRIPTION)))
+      + listed("args      ", config.args)
+      + listed("env       ", config.env |> list.map((e) => "${e.name}=${e.value}"))
+      + listed("asks for  ", wants)
+    println(list.join(lines, "\n"))
+  }
+  0
+}
+
+local effect fn cmd_tag(args: List[String]) -> Int = {
+  let (source, target) = match args {
+    [s, t] => (reference.parse(s)!, reference.parse(t)!),
+    _ => err("tag takes two names: nautra tag SOURCE NAME")!,
+  }
+  guard target.digest == "" else err("a new name cannot carry a digest")!
+  let store_dir = store.open()!
+  let stored = store.resolve(store_dir, reference.key(source))! |> option.to_result("no image named ${reference.key(source)}")!
+  store.set_ref(store_dir, reference.key(target), stored)!
+  println("${reference.key(target)}  ${stored.digest}")
+  0
+}
+
+local effect fn cmd_rmi(args: List[String]) -> Int = {
+  guard not list.is_empty(args) else err("rmi needs at least one image")!
+  let store_dir = store.open()!
+  var missing = 0
+  for text in args {
+    let key = reference.key(reference.parse(text)!)
+    if store.remove_ref(store_dir, key)! then println("removed ${key}") else {
+      eprintln("nautra: no image named ${key}")
+      missing = missing + 1
+    }
+  }
+  let _ = store.prune(store_dir)!
+  if missing == 0 then 0 else 1
+}
+
+local effect fn cmd_pull(args: List[String]) -> Int = {
+  let r = reference.parse(list.get(args, 0) |> option.to_result("pull needs an image")!)!
+  let stored = pull_into(store.open()!, r)!
+  println("${reference.key(r)}  ${stored.digest}")
+  0
+}
+
+local effect fn cmd_push(args: List[String]) -> Int = {
+  let r = reference.parse(list.get(args, 0) |> option.to_result("push needs an image")!)!
+  let store_dir = store.open()!
+  let uploaded = registry.push(store_dir, r)!
+  let stored = store.resolve(store_dir, reference.key(r))! |> option.to_result("no image named ${reference.key(r)}")!
+  println("${reference.key(r)}  ${stored.digest}  (${uploaded} blob${if uploaded == 1 then "" else "s"} uploaded)")
+  0
+}
+
+local effect fn dispatch(args: List[String]) -> Int = {
+  let rest = list.drop(args, 1)
+  match list.get(args, 0) ?? "help" {
+    "run" => cmd_run(rest)!,
+    "build" => cmd_build(rest)!,
+    "images" | "image" | "ls" => cmd_images()!,
+    "inspect" => cmd_inspect(rest)!,
+    "tag" => cmd_tag(rest)!,
+    "rmi" | "rm" => cmd_rmi(rest)!,
+    "pull" => cmd_pull(rest)!,
+    "push" => cmd_push(rest)!,
+    "version" | "--version" | "-V" => {
+      println("nautra ${help.VERSION}")
+      0
+    },
+    "help" | "--help" | "-h" => {
+      println(help.usage())
+      0
+    },
+    other => err("unknown command '${other}'; see `nautra help`")!,
+  }
+}
+
+// 125 is a run nautra itself refused or could not start, as in the tools
+// this one sits beside; the guest's own exit code is passed through.
+effect fn main() -> Unit = {
+  match dispatch(env.args()) {
+    ok(code) => process.exit(code),
+    err(message) => {
+      eprintln("nautra: ${message}")
+      process.exit(125)
+    },
+  }
+}
+
+test "sizes read in decimal units" {
+  assert_eq(human_size(999), "999 B")
+  assert_eq(human_size(3651), "3.6 kB")
+  assert_eq(human_size(1234567), "1.2 MB")
+}
+
+test "a table pads every column but the last" {
+  assert_eq(table([["NAME", "KIND"], ["app:v1", "module"]]), "NAME    KIND\napp:v1  module")
+}
+
+test "digests are shortened for display" {
+  assert_eq(short("sha256:0123456789abcdef"), "0123456789ab")
+}

@@ -1,7 +1,23 @@
 # Contributing
 
-Nautra is at the very start; the design is still being written down. Open an
-issue before sending anything larger than a small fix.
+Nautra is pre-alpha. Open an issue before sending anything larger than a small
+fix, and read [docs/adr/0001-foundations.md](docs/adr/0001-foundations.md)
+first: it records the decisions a change has to fit.
+
+## Build and test
+
+You need Rust 1.97 or newer.
+
+```bash
+bash scripts/install-almide.sh
+.tools/almide/almide test
+.tools/almide/almide build src/main.almd -o target/nautra
+bash scripts/build-examples.sh
+python3 scripts/integration.py target/nautra
+```
+
+A change in behaviour comes with a check in `scripts/integration.py` or a
+`test` block beside the code.
 
 ## Licence of contributions
 

@@ -1,0 +1,211 @@
+// SPDX-License-Identifier: Apache-2.0
+// What a run is given. A workload starts with nothing: no directory, no
+// network, no environment, a closed stdin. Each option here opens one thing,
+// and nothing an image says about itself opens anything.
+
+type Mount = { host: String, guest: String, readonly: Bool }
+
+// `host` is a name, an address or `*`; `port` 0 is any port.
+type NetRule = { host: String, port: Int }
+
+// An environment variable to set, or (value none) one to copy from the host.
+type EnvGrant = { name: String, value: String? }
+
+type Grants = {
+  mounts: List[Mount],
+  env: List[EnvGrant],
+  net_all: Bool,
+  net: List[NetRule],
+  memory_bytes: Int,
+  timeout_ms: Int,
+  fuel: Int,
+  stdin: Bool,
+}
+
+// A parsed `nautra run` line: the grants, the image, and the guest's arguments.
+type RunLine = { grants: Grants, image: String, args: List[String] }
+
+fn nothing() -> Grants = Grants {
+  mounts: [],
+  env: [],
+  net_all: false,
+  net: [],
+  memory_bytes: 0,
+  timeout_ms: 0,
+  fuel: 0,
+  stdin: false,
+}
+
+// `HOST:GUEST[:ro|:rw]`. The guest path is where the workload sees the
+// directory, so it is absolute.
+fn parse_mount(text: String) -> Mount! = {
+  let parts = string.split(text, ":")
+  let (host, guest, mode) = match parts {
+    [h, g] => (h, g, "rw"),
+    [h, g, m] => (h, g, m),
+    _ => ("", "", ""),
+  }
+  guard host != "" and guest != "" else err("'${text}' is not a mount: write HOST_DIR:GUEST_DIR or HOST_DIR:GUEST_DIR:ro")
+  guard string.starts_with(guest, "/") else err("the guest side of '${text}' must be an absolute path")
+  guard mode == "ro" or mode == "rw" else err("'${mode}' is not a mount mode: use ro or rw")
+  Mount { host: host, guest: guest, readonly: mode == "ro" }
+}
+
+// `NAME=VALUE` sets; a bare `NAME` copies the host's value.
+fn parse_env(text: String) -> EnvGrant! = {
+  let (name, value) = match string.split_once(text, "=") {
+    some((n, v)) => (n, some(v)),
+    none => (text, none),
+  }
+  guard name != "" else err("'${text}' names no environment variable")
+  EnvGrant { name: name, value: value }
+}
+
+local fn parse_port(text: String, whole: String) -> Int! = {
+  let port = int.parse(text) |> result.map_err((_) => "'${whole}' has a port that is not a number")!
+  guard port >= 1 and port <= 65535 else err("'${whole}' has a port outside 1-65535")
+  port
+}
+
+// `HOST:PORT`, `HOST` (any port), `*:PORT`, `[v6]:PORT`. A lone `*` is every
+// destination and is handled by the caller.
+fn parse_net(text: String) -> NetRule! = {
+  guard text != "" else err("an empty network grant")
+  if string.starts_with(text, "[") then {
+    let (host, rest) = string.split_once(string.drop(text, 1), "]") |> option.to_result("'${text}' has an unclosed '['")!
+    let port = if rest == "" then 0 else parse_port(string.strip_prefix(rest, ":") ?? "", text)!
+    NetRule { host: host, port: port }
+  } else if string.count_matches(text, ":") == 1 then {
+    let (host, port) = string.split_once(text, ":") ?? (text, "")
+    guard host != "" else err("'${text}' names no host")
+    NetRule { host: host, port: parse_port(port, text)! }
+  } else {
+    // No colon is a host on any port; several is a bare IPv6 address.
+    NetRule { host: text, port: 0 }
+  }
+}
+
+local fn scaled(text: String, units: List[(String, Int)], what: String) -> Int! = {
+  let lower = string.to_lower(text)
+  let (digits, factor) = units
+    |> list.find_map(((suffix, factor)) => string.strip_suffix(lower, suffix) |> option.map((d) => (d, factor)))
+    |> option.to_result("'${text}' is not ${what}")!
+  let n = int.parse(digits) |> result.map_err((_) => "'${text}' is not ${what}")!
+  guard n > 0 else err("'${text}' is not ${what}")
+  n * factor
+}
+
+// `64m`, `1g`, `512k`, or plain bytes.
+fn parse_size(text: String) -> Int! =
+  scaled(text, [("kb", 1024), ("mb", 1048576), ("gb", 1073741824), ("k", 1024), ("m", 1048576), ("g", 1073741824), ("b", 1), ("", 1)], "a size such as 64m or 1g")
+
+// `500ms`, `30s`, `2m`, `1h`; a plain number is seconds.
+fn parse_duration(text: String) -> Int! =
+  scaled(text, [("ms", 1), ("s", 1000), ("m", 60000), ("h", 3600000), ("", 1000)], "a duration such as 500ms, 30s or 2m")
+
+local fn with_value(g: Grants, flag: String, text: String) -> Grants! = match flag {
+  "-v" | "--volume" => { ...g, mounts: g.mounts + [parse_mount(text)!] },
+  "-e" | "--env" => { ...g, env: g.env + [parse_env(text)!] },
+  "--allow-net" => if text == "*" then { ...g, net_all: true } else { ...g, net: g.net + [parse_net(text)!] },
+  "-m" | "--memory" => { ...g, memory_bytes: parse_size(text)! },
+  "--timeout" => { ...g, timeout_ms: parse_duration(text)! },
+  "--fuel" => {
+    let fuel = int.parse(text) |> result.map_err((_) => "'${text}' is not an amount of fuel")!
+    guard fuel > 0 else err("'${text}' is not an amount of fuel")
+    { ...g, fuel: fuel }
+  },
+  _ => err("unknown option '${flag}'"),
+}
+
+local fn takes_value(flag: String) -> Bool =
+  list.contains(["-v", "--volume", "-e", "--env", "--allow-net", "-m", "--memory", "--timeout", "--fuel"], flag)
+
+// Options come before the image; everything after it belongs to the guest.
+fn parse_run(args: List[String]) -> RunLine! = {
+  var grants = nothing()
+  var i = 0
+  var image = ""
+  while image == "" and i < list.len(args) {
+    let arg = list.get(args, i) ?? ""
+    i = i + 1
+    if not string.starts_with(arg, "-") then {
+      image = arg
+    } else {
+      let (flag, inline) = match string.split_once(arg, "=") {
+        some((o, v)) if string.starts_with(arg, "--") => (o, some(v)),
+        _ => (arg, none),
+      }
+      if takes_value(flag) then {
+        let text = match inline {
+          some(v) => v,
+          none => {
+            let next = list.get(args, i) |> option.to_result("${flag} needs a value")!
+            i = i + 1
+            next
+          },
+        }
+        grants = with_value(grants, flag, text)!
+      } else {
+        match flag {
+          "-i" | "--interactive" => { grants = { ...grants, stdin: true } },
+          // A run leaves nothing behind to remove; accepted so the habit works.
+          "--rm" => (),
+          _ => err("unknown option '${flag}'")!,
+        }
+      }
+    }
+  }
+  guard image != "" else err("run needs an image or a .wasm file")
+  RunLine { grants: grants, image: image, args: list.drop(args, i) }
+}
+
+test "a workload is given nothing by default" {
+  let line = parse_run(["app:v1"])!
+  assert_eq(line.grants, nothing())
+  assert_eq(line.image, "app:v1")
+  assert_eq(line.args, [])
+}
+
+test "options stop at the image" {
+  let line = parse_run(["-v", "./data:/data:ro", "--memory=64m", "app", "-v", "x"])!
+  assert_eq(line.grants.mounts, [Mount { host: "./data", guest: "/data", readonly: true }])
+  assert_eq(line.grants.memory_bytes, 64 * 1048576)
+  assert_eq(line.args, ["-v", "x"])
+}
+
+test "environment is set or copied by name" {
+  let line = parse_run(["-e", "A=1=2", "--env", "HOME", "app"])!
+  assert_eq(line.grants.env, [EnvGrant { name: "A", value: some("1=2") }, EnvGrant { name: "HOME", value: none }])
+}
+
+test "network grants name a destination" {
+  assert_eq(parse_net("api.example.com:443"), ok(NetRule { host: "api.example.com", port: 443 }))
+  assert_eq(parse_net("*:443"), ok(NetRule { host: "*", port: 443 }))
+  assert_eq(parse_net("10.0.0.1"), ok(NetRule { host: "10.0.0.1", port: 0 }))
+  assert_eq(parse_net("[::1]:8080"), ok(NetRule { host: "::1", port: 8080 }))
+  assert_eq(parse_net("::1"), ok(NetRule { host: "::1", port: 0 }))
+  assert(result.is_err(parse_net("host:http")))
+  assert(result.is_err(parse_net("host:70000")))
+  let line = parse_run(["--allow-net", "*", "app"])!
+  assert(line.grants.net_all)
+}
+
+test "sizes and durations carry units" {
+  assert_eq(parse_size("512k"), ok(524288))
+  assert_eq(parse_size("1G"), ok(1073741824))
+  assert_eq(parse_size("100"), ok(100))
+  assert(result.is_err(parse_size("lots")))
+  assert_eq(parse_duration("500ms"), ok(500))
+  assert_eq(parse_duration("2m"), ok(120000))
+  assert_eq(parse_duration("30"), ok(30000))
+  assert(result.is_err(parse_duration("0s")))
+}
+
+test "mistakes are refused, not guessed" {
+  assert(result.is_err(parse_run([])))
+  assert(result.is_err(parse_run(["--privileged", "app"])))
+  assert(result.is_err(parse_run(["-v"])))
+  assert(result.is_err(parse_run(["-v", "data", "app"])))
+  assert(result.is_err(parse_run(["-v", "./a:rel", "app"])))
+  assert(result.is_err(parse_run(["-v", "./a:/a:exec", "app"])))
+}

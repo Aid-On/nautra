@@ -1,0 +1,133 @@
+// SPDX-License-Identifier: Apache-2.0
+// The local image store: an OCI image layout on disk.
+//
+//   <home>/store/oci-layout
+//   <home>/store/index.json            one descriptor per stored name
+//   <home>/store/blobs/sha256/<hex>    manifests, configs and Wasm binaries
+//
+// Blobs are named by their own digest, and a blob is checked against its name
+// every time it is read, so what runs is what the digest says.
+
+import env
+import fs
+import hash
+import json
+import path
+import process
+import self.oci
+
+effect fn home() -> String = match env.get("NAUTRA_HOME") {
+  some(dir) if dir != "" => dir,
+  _ => path.join(env.get("HOME") ?? ".", ".nautra"),
+}
+
+effect fn root() -> String = path.join(home()!, "store")
+
+local fn index_path(store: String) -> String = path.join(store, "index.json")
+
+fn blob_path(store: String, digest: String) -> String =
+  path.join(path.join(path.join(store, "blobs"), "sha256"), string.strip_prefix(digest, "sha256:") ?? digest)
+
+fn digest_of(data: Bytes) -> String = "sha256:" + hash.sha256_hex(data)
+
+// Written beside the target and renamed over it, so a reader never sees half
+// a file and an interrupted write leaves the old one in place.
+local effect fn write_atomic(target: String, data: Bytes) -> Unit = {
+  let scratch = "${target}.tmp-${process.pid()}"
+  fs.write_bytes(scratch, data)!
+  fs.rename(scratch, target)!
+}
+
+effect fn open() -> String = {
+  let store = root()!
+  fs.mkdir_p(path.join(path.join(store, "blobs"), "sha256"))!
+  if not fs.exists(path.join(store, "oci-layout")) then {
+    fs.write_text(path.join(store, "oci-layout"), "{\"imageLayoutVersion\":\"1.0.0\"}\n")!
+  }
+  if not fs.exists(index_path(store)) then {
+    write_index(store, oci.Index { schemaVersion: 2, mediaType: some(oci.INDEX), manifests: [] })!
+  }
+  store
+}
+
+effect fn read_index(store: String) -> oci.Index =
+  oci.parse_index(fs.read_text(index_path(store))!) |> result.map_err((e) => "the image store is damaged: ${e}")!
+
+local effect fn write_index(store: String, index: oci.Index) -> Unit =
+  write_atomic(index_path(store), bytes.from_string(json.stringify_pretty(oci.Index.encode(index)) + "\n"))!
+
+effect fn put_blob(store: String, data: Bytes) -> String = {
+  let digest = digest_of(data)
+  let target = blob_path(store, digest)
+  if not fs.exists(target) then {
+    write_atomic(target, data)!
+  }
+  digest
+}
+
+effect fn has_blob(store: String, digest: String) -> Bool = fs.exists(blob_path(store, digest))
+
+// Reads a blob and refuses it unless its bytes still hash to its name.
+effect fn read_blob(store: String, digest: String) -> Bytes = {
+  let data = fs.read_bytes(blob_path(store, digest)) |> result.map_err((e) => "blob ${digest} is missing from the store: ${e}")!
+  guard digest_of(data) == digest else err("blob ${digest} is corrupt: its contents no longer match its digest")!
+  data
+}
+
+fn descriptor(media_type: String, digest: String, size: Int) -> oci.Descriptor =
+  oci.Descriptor { mediaType: media_type, digest: digest, size: size }
+
+effect fn put(store: String, media_type: String, data: Bytes) -> oci.Descriptor =
+  descriptor(media_type, put_blob(store, data)!, bytes.len(data))
+
+local fn named(d: oci.Descriptor) -> String = oci.annotation(d.annotations, oci.REF_NAME) ?? ""
+
+// Every stored name with the manifest it points at.
+effect fn list_refs(store: String) -> List[(String, oci.Descriptor)] =
+  read_index(store)!.manifests |> list.map((d) => (named(d), d)) |> list.filter(((n, _)) => n != "")
+
+effect fn resolve(store: String, key: String) -> oci.Descriptor? =
+  read_index(store)!.manifests |> list.find((d) => named(d) == key)
+
+// Points a name at a manifest, replacing whatever it pointed at before.
+effect fn set_ref(store: String, key: String, manifest: oci.Descriptor) -> Unit = {
+  let index = read_index(store)!
+  let tagged = { ...manifest, annotations: some(value.object([(oci.REF_NAME, value.string(key))])) }
+  let others = index.manifests |> list.filter((d) => named(d) != key)
+  write_index(store, { ...index, manifests: others + [tagged] })!
+}
+
+// Removes a name. Returns false when nothing was stored under it.
+effect fn remove_ref(store: String, key: String) -> Bool = {
+  let index = read_index(store)!
+  let others = index.manifests |> list.filter((d) => named(d) != key)
+  if list.len(others) == list.len(index.manifests) then false else {
+    write_index(store, { ...index, manifests: others })!
+    true
+  }
+}
+
+effect fn read_manifest(store: String, digest: String) -> oci.Manifest =
+  oci.parse_manifest(bytes.to_string_lossy(read_blob(store, digest)!))!
+
+// Deletes every blob no stored name reaches. Returns how many went.
+effect fn prune(store: String) -> Int = {
+  var live: List[String] = []
+  for d in read_index(store)!.manifests {
+    live = live + [d.digest]
+    // A manifest that cannot be read keeps nothing else alive.
+    match read_manifest(store, d.digest) {
+      ok(m) => { live = live + [m.config.digest] + (m.layers |> list.map((layer) => layer.digest)) },
+      err(_) => (),
+    }
+  }
+  let dir = path.join(path.join(store, "blobs"), "sha256")
+  var removed = 0
+  for file in fs.list_dir(dir)! {
+    if not list.contains(live, "sha256:${file}") then {
+      fs.remove(path.join(dir, file))!
+      removed = removed + 1
+    }
+  }
+  removed
+}

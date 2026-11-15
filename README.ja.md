@@ -5,20 +5,22 @@
   </picture>
 </p>
 
-<p align="center"><strong>WebAssembly のワークロードをビルドし、配布し、実行する。</strong></p>
+<p align="center"><strong>WebAssembly のワークロードをビルドし、配布し、実行する。渡した権限だけで。</strong></p>
 
 <p align="center">
+  <a href="https://github.com/Aid-On/nautra/actions/workflows/ci.yml"><img src="https://github.com/Aid-On/nautra/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="./LICENSING.md"><img src="https://img.shields.io/badge/license-Apache--2.0%20%2B%20Enterprise-6447f0.svg" alt="License: Apache-2.0 + Nautra Enterprise"></a>
   <img src="https://img.shields.io/badge/status-pre--alpha-c679fc.svg" alt="Status: pre-alpha">
 </p>
 
 <p align="center">
-  <a href="#目指すもの">目指すもの</a> ·
+  <a href="#クイックスタート">クイックスタート</a> ·
+  <a href="#権限">権限</a> ·
+  <a href="#イメージ">イメージ</a> ·
+  <a href="#レジストリ">レジストリ</a> ·
   <a href="#現状">現状</a> ·
-  <a href="#エディションとライセンス">エディション</a> ·
-  <a href="./LICENSING.md">ライセンス</a> ·
-  <a href="./CONTRIBUTING.md">コントリビューション</a> ·
-  <a href="./SECURITY.md">セキュリティ</a>
+  <a href="./docs/adr/0001-foundations.md">設計</a> ·
+  <a href="./LICENSING.md">ライセンス</a>
 </p>
 
 <p align="center">
@@ -26,17 +28,144 @@
   <a href="README.ja.md"><img alt="日本語" src="https://img.shields.io/badge/%E6%97%A5%E6%9C%AC%E8%AA%9E-24292f?style=flat-square"></a>
 </p>
 
-## 目指すもの
+```text
+$ nautra build -t upper:v1 .
+upper:v1  sha256:802fb65f45b0acc4f189fca1e7d3deb22aadf4f363c035a0bbdbdcc1969c04b5
 
-Nautra は、Linux コンテナに対するコンテナエンジンの役割を、Wasm コンポーネントに対して担います。
+$ nautra run upper:v1
+nautra: this image asks for grants this run does not give: -v <dir>:/data  --allow-net api.example.com:443  -e API_TOKEN
+Error: fs.read_text("/data/in.txt"): Bad file descriptor (os error 9)
 
-Wasm モジュールは、それ自体がサンドボックスです。ファイルシステムもネットワークも持たない状態で起動し、渡された権限だけを使えます。Nautra はこの単位を扱う道具をそろえます。イメージとしてまとめ、レジストリで配布し、明示的に渡した権限だけで実行します。ゲストカーネルもデーモンも要りません。
+$ nautra run -v ./data:/data upper:v1
+copied 5 characters from /data/in.txt to /data/out.txt
+```
 
-開発元は [Aid-On](https://github.com/Aid-On) です。姉妹プロジェクトの [Porta](https://github.com/almide/porta) はホストのカーネルでネイティブプロセスを閉じ込めます。Nautra が扱う単位は Wasm コンポーネントです。
+Nautra は、Linux コンテナに対するコンテナエンジンの役割を、WebAssembly に対して担います。`.wasm` バイナリをイメージにまとめ、OCI レジストリで配布し、実行します。
+
+コンテナとの違いは出発点です。コンテナはファイルシステムとネットワークを丸ごと持った状態から始まり、そこから制限をかけます。Wasm のワークロードは**何も持たない**状態から始まります。ディレクトリもネットワークも環境変数もなく、標準入力は閉じています。使えるのは `run` の行に書いたものだけです。デーモンもゲストカーネルも root も要りません。
+
+開発元は [Aid-On](https://github.com/Aid-On) です。[Almide](https://github.com/almide/almide) で書かれ、[wasmtime](https://wasmtime.dev) の上で動きます。Nautra は [Porta](https://github.com/almide/porta) から派生しました。Porta はホストのカーネルでネイティブプロセスを閉じ込めます。Nautra が扱う単位は Wasm バイナリです。
+
+## クイックスタート
+
+リリースバイナリはまだ公開していないので、ソースからビルドします。Rust 1.97 以降が必要です。
+
+```bash
+git clone https://github.com/Aid-On/nautra && cd nautra
+bash scripts/install-almide.sh                       # 固定した Almide コンパイラを入れる
+.tools/almide/almide build src/main.almd -o target/nautra
+bash scripts/build-examples.sh                       # サンプルを target/wasm にビルドする
+```
+
+`.wasm` ファイルはそのまま実行できます。イメージにまとめてから実行することもできます。
+
+```bash
+target/nautra run target/wasm/hello.wasm tide        # hello, tide
+target/nautra build -t hello:v1 target/wasm/hello.wasm
+target/nautra run hello:v1 tide
+target/nautra images
+```
+
+コアモジュール（WASI preview 1）とコンポーネント（WASI 0.2、0.3）のどれも実行できます。どれとして扱うかは、バイナリのヘッダで決まります。
+
+## 権限
+
+オプション1つが、1つのものを開きます。オプションはイメージ名の前に書きます。イメージ名より後ろはすべてワークロードの引数になります。
+
+| オプション | 開くもの |
+|---|---|
+| `-v HOST:GUEST[:ro]` | ディレクトリ1つ。`GUEST` はワークロードから見える場所。`:ro` を付けると読み取りのみ |
+| `-e NAME=VALUE`、`-e NAME` | 環境変数1つ。名前だけ書くとホストの値を渡す |
+| `--allow-net HOST:PORT` | 接続先1つ。`HOST` だけ、`*:PORT`、すべてを許す `*` も書ける |
+| `-i` | この端末の標準入力 |
+| `-m 64m` | メモリの上限 |
+| `--timeout 30s` | 制限時間（終了コード 124） |
+| `--fuel N` | 実行できる命令数の上限（終了コード 137） |
+
+```text
+$ nautra run target/wasm/dial.wasm 127.0.0.1 8080
+Error: tcp_connect(127.0.0.1:8080): permission denied
+
+$ nautra run --allow-net 127.0.0.1:8080 target/wasm/dial.wasm 127.0.0.1 8080
+connected to 127.0.0.1:8080
+```
+
+`--allow-net` に書いたホスト名は、ワークロードが動き出す前に1度だけ名前解決します。そのため、許可された名前の指す先をワークロードが後から変えることはできません。マウントしたディレクトリの外へは、`..` でもシンボリックリンクでも出られません。
+
+ワークロード自身の終了コードは、そのまま返します。`125` は、Nautra が実行を拒否したか、開始できなかったことを表します。
+
+## イメージ
+
+イメージは、`.wasm` バイナリとその説明をまとめたものです。説明は `Nautrafile` に書きます。
+
+```toml
+wasm = "app.wasm"
+description = "Uppercases /data/in.txt into /data/out.txt"
+
+[run]
+args = ["/data/in.txt", "/data/out.txt"]
+
+[run.env]
+LOG_LEVEL = "info"
+
+[wants]                     # 実行時に渡してほしい権限
+mounts = ["/data"]
+net = ["api.example.com:443"]
+env = ["API_TOKEN"]
+```
+
+`[wants]` はイメージの作者による申告で、許可ではありません。Nautra はこれを表示するだけです。表示するのは、`inspect` したときと、申告された権限を渡さずに `run` したときです。イメージが求めたからといって、何かが開くことはありません。
+
+```text
+$ nautra inspect upper:v1
+name      upper:v1
+digest    sha256:802fb65f45b0acc4f189fca1e7d3deb22aadf4f363c035a0bbdbdcc1969c04b5
+wasm      sha256:e45630d64ca18182ead688724388cabc2a5958fb6fc1e835fd95ef2a8eb80d03
+kind      module
+size      19.3 kB
+reach     files, environment
+about     Uppercases /data/in.txt into /data/out.txt
+args      /data/in.txt, /data/out.txt
+env       LOG_LEVEL=info
+asks for  -v <dir>:/data, --allow-net api.example.com:443, -e API_TOKEN
+```
+
+`reach` はバイナリの import から読み取った値で、そのバイナリが使いうるものの外枠を表します。ソケットを import していないバイナリは、どんな権限を渡されてもネットワークに届きません。
+
+イメージは、標準の [OCI image layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md) として `~/.nautra/store` に保存します。場所は `$NAUTRA_HOME` で変えられます。形式は CNCF の [Wasm OCI Artifact](https://tag-runtime.cncf.io/wgs/wasm/deliverables/wasm-oci-artifact/) に合わせています。blob は読むたびにダイジェストと照合するので、ディスク上で書き換わったバイナリは実行されず、拒否されます。`SOURCE_DATE_EPOCH` を設定すると、同じ入力からは同じダイジェストができます。
+
+| | |
+|---|---|
+| `nautra build [-t NAME] [-f Nautrafile] [PATH]` | イメージを作る。`PATH` は Nautrafile のあるディレクトリか、`.wasm` ファイル |
+| `nautra images` | 一覧を出す |
+| `nautra inspect IMAGE\|FILE.wasm` | 中身、求めている権限、届きうる範囲を表示する |
+| `nautra tag SOURCE NAME` | 別の名前を付ける |
+| `nautra rmi IMAGE…` | 名前を消す。どこからも参照されなくなった blob も消す |
+
+## レジストリ
+
+```bash
+nautra build -t ghcr.io/you/app:v1 .
+nautra push ghcr.io/you/app:v1
+nautra run ghcr.io/you/app:v1          # 初回は自動で pull する
+nautra pull ghcr.io/you/app@sha256:…   # ダイジェストで固定する
+```
+
+OCI Distribution API に対応したレジストリなら、どれでも使えます。レジストリ名のない名前（`app:v1`）はローカル専用です。Nautra には既定のレジストリがないので、書かれていないレジストリに接続することはありません。pull したものは、ストアに入れる前にすべてハッシュを計算し、指定されたダイジェストと照合します。Wasm のレイヤーを持たないイメージ（Linux コンテナのイメージ）は拒否します。
+
+ログイン情報は、環境変数 `NAUTRA_USERNAME` と `NAUTRA_PASSWORD` から読みます。パスワードにはレジストリのトークンも使えます。
 
 ## 現状
 
-**まだ使えません。** このリポジトリにあるのは、名前、ブランド素材、ライセンス構成、コントリビューション条件だけです。コードもリリースもありません。
+**プレアルファです。** ここまでに書いた機能は動作し、macOS 上で `scripts/integration.py` が検証しています。Linux は CI でビルドしています。push と pull はローカルの `registry:2` で検証済みですが、公開レジストリではまだ検証していません。
+
+まだ無いもの：
+
+- HTTP の提供（`wasi:http`）とポートの公開、`wasi:http` による外向きの通信
+- 長時間動くワークロードの扱い（バックグラウンド実行、ログ、再起動ポリシー）
+- 複数のワークロードをまとめて動かす機能（compose）と、その間のネットワーク
+- 署名、来歴の証明、pull してよいものを決めるポリシー
+- 認証情報ヘルパー、コンパイル結果のキャッシュ、リリースバイナリ
 
 ## エディションとライセンス
 
@@ -47,7 +176,7 @@ Nautra はオープンコアです。
 | ソース | [`ee/`](ee/) 以外のすべて | [`ee/`](ee/) の内容を加えたもの |
 | ライセンス | [Apache License 2.0](LICENSE) | [Nautra Enterprise License](ee/LICENSE)。Aid-On とのサブスクリプション契約が必要 |
 
-2つの境界と、それを保つためのルールは [LICENSING.md](LICENSING.md) にあります。名前とロゴの扱いは [TRADEMARKS.md](TRADEMARKS.md) で定めています。
+この README に書いた機能は、すべて Community Edition のものです。2つの境界と、それを保つためのルールは [LICENSING.md](LICENSING.md) にあります。名前とロゴの扱いは [TRADEMARKS.md](TRADEMARKS.md) で定めています。
 
 ## コントリビューション
 

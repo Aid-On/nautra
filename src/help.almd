@@ -1,0 +1,36 @@
+// SPDX-License-Identifier: Apache-2.0
+
+let VERSION = "0.1.0"
+
+fn usage() -> String = """
+  nautra — build, ship and run WebAssembly workloads
+
+  Usage: nautra <command> [options]
+
+    run [grants] IMAGE|FILE.wasm [args…]   run a workload with exactly what you grant it
+    build [-t NAME] [-f Nautrafile] [PATH]  package a .wasm file as an image
+    images                                  list stored images
+    inspect IMAGE|FILE.wasm                 what an image is, what it asks for, what it can reach
+    tag SOURCE NAME                         give a stored image another name
+    rmi IMAGE…                              remove stored images
+    pull IMAGE                              fetch an image from an OCI registry
+    push IMAGE                              publish an image to an OCI registry
+    version                                 print the version
+
+  A workload starts with nothing: no directory, no network, no environment,
+  a closed stdin. Each grant on `run` opens one thing:
+
+    -v, --volume HOST:GUEST[:ro]   a directory, where the guest sees it
+    -e, --env NAME=VALUE | NAME    a variable; a bare NAME copies the host's
+        --allow-net HOST:PORT      one destination; HOST, *:PORT, or * for all
+    -i, --interactive              this terminal's stdin
+    -m, --memory SIZE              a memory ceiling (64m, 1g)
+        --timeout DURATION         a deadline (500ms, 30s, 2m)
+        --fuel N                   a ceiling on executed instructions
+
+  Grants come before the image; everything after it is the workload's own.
+
+  An image is named [REGISTRY/]NAME[:TAG][@DIGEST]. A name with no registry is
+  local. Images live in $NAUTRA_HOME (default ~/.nautra). Registry logins are
+  read from NAUTRA_USERNAME and NAUTRA_PASSWORD.
+  """

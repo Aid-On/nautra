@@ -1,0 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
+// Never finishes: for trying --timeout and --fuel.
+fn main() -> Unit = {
+  var n = 0
+  while true {
+    n = n + 1
+  }
+}

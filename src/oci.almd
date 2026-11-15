@@ -1,0 +1,96 @@
+// SPDX-License-Identifier: Apache-2.0
+// The OCI wire formats nautra reads and writes, with their wire names.
+//
+// A nautra image is an ordinary OCI image whose one layer is a WebAssembly
+// binary, in the shape the CNCF Wasm OCI Artifact layout describes, so any
+// OCI registry stores it and other Wasm tooling can pull it.
+
+import json
+
+let MANIFEST = "application/vnd.oci.image.manifest.v1+json"
+let INDEX = "application/vnd.oci.image.index.v1+json"
+let DOCKER_MANIFEST = "application/vnd.docker.distribution.manifest.v2+json"
+let DOCKER_INDEX = "application/vnd.docker.distribution.manifest.list.v2+json"
+let WASM_CONFIG = "application/vnd.wasm.config.v0+json"
+let WASM_LAYER = "application/wasm"
+
+// Layer types earlier Wasm tooling published under; still a Wasm binary.
+let LEGACY_WASM_LAYERS = [
+  "application/vnd.wasm.content.layer.v1+wasm",
+  "application/vnd.bytecodealliance.wasm.component.layer.v0+wasm",
+  "application/vnd.module.wasm.content.layer.v1+wasm",
+]
+
+let REF_NAME = "org.opencontainers.image.ref.name"
+let CREATED = "org.opencontainers.image.created"
+let DESCRIPTION = "org.opencontainers.image.description"
+// What the image's author says a run needs; see image.almd.
+let NAUTRA_CONFIG = "dev.nautra.config"
+
+type Descriptor: Codec = {
+  mediaType: String,
+  digest: String,
+  size: Int,
+  annotations: Option[Value] = none,
+  platform: Option[Value] = none,
+}
+
+type Manifest: Codec = {
+  schemaVersion: Int,
+  mediaType: Option[String] = none,
+  artifactType: Option[String] = none,
+  config: Descriptor,
+  layers: List[Descriptor],
+  annotations: Option[Value] = none,
+}
+
+type Index: Codec = {
+  schemaVersion: Int,
+  mediaType: Option[String] = none,
+  manifests: List[Descriptor],
+}
+
+fn annotation(annotations: Option[Value], name: String) -> String? = match annotations {
+  some(v) => value.get_string(v, name),
+  none => none,
+}
+
+fn is_wasm_layer(media_type: String) -> Bool =
+  media_type == WASM_LAYER or list.contains(LEGACY_WASM_LAYERS, media_type)
+
+fn is_index(media_type: String) -> Bool = media_type == INDEX or media_type == DOCKER_INDEX
+
+// The layer a run executes: the first one that is a Wasm binary.
+fn wasm_layer(m: Manifest) -> Descriptor? = m.layers |> list.find((layer) => is_wasm_layer(layer.mediaType))
+
+fn parse_manifest(text: String) -> Manifest! = {
+  let doc = json.parse(text) |> result.map_err((e) => "manifest is not JSON: ${e}")!
+  Manifest.decode(doc) |> result.map_err((e) => "not an image manifest: ${e}")
+}
+
+fn parse_index(text: String) -> Index! = {
+  let doc = json.parse(text) |> result.map_err((e) => "index is not JSON: ${e}")!
+  Index.decode(doc) |> result.map_err((e) => "not an image index: ${e}")
+}
+
+test "a manifest roundtrips and omits what is unset" {
+  let layer = Descriptor { mediaType: WASM_LAYER, digest: "sha256:aa", size: 3 }
+  let m = Manifest { schemaVersion: 2, mediaType: some(MANIFEST), config: layer, layers: [layer] }
+  let text = json.stringify(Manifest.encode(m))
+  assert(not string.contains(text, "annotations"))
+  assert_eq(parse_manifest(text), ok(m))
+  assert_eq(wasm_layer(m), some(layer))
+}
+
+test "annotations are read by name" {
+  let a = some(value.object([(REF_NAME, value.string("app:v1"))]))
+  assert_eq(annotation(a, REF_NAME), some("app:v1"))
+  assert_eq(annotation(a, CREATED), none)
+  assert_eq(annotation(none, REF_NAME), none)
+}
+
+test "an image with no wasm layer has nothing to run" {
+  let tar = Descriptor { mediaType: "application/vnd.oci.image.layer.v1.tar+gzip", digest: "sha256:bb", size: 9 }
+  let m = Manifest { schemaVersion: 2, config: tar, layers: [tar] }
+  assert_eq(wasm_layer(m), none)
+}
