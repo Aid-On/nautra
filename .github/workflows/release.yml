@@ -1,0 +1,170 @@
+name: Release
+
+# A tag `vX.Y.Z` builds nautra on every platform it is released for, runs the
+# integration suite against each binary on the machine that built it, and
+# publishes the binaries and the container image. A pull request that touches
+# this file or the Dockerfile runs the same jobs and publishes nothing.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - Dockerfile
+      - .dockerignore
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PUBLISH: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: linux-aarch64
+          - os: macos-latest
+            target: macos-aarch64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust 1.97 or newer
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+      - name: Almide
+        run: bash scripts/install-almide.sh
+      # The tag, the binary and the manifest say one version, or nothing ships.
+      - name: The tag is the version in the source
+        if: env.PUBLISH == 'true'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          grep -q "^version = \"$tag\"$" almide.toml || { echo "almide.toml does not say version $tag"; exit 1; }
+          grep -q "^let VERSION = \"$tag\"$" src/help.almd || { echo "src/help.almd does not say version $tag"; exit 1; }
+      - name: Build
+        run: .tools/almide/almide build src/main.almd -o target/nautra
+      - name: Example guests
+        run: bash scripts/build-examples.sh
+      # A binary nobody ran is not released: the suite that gates a commit
+      # gates this file, on the machine that produced it.
+      - name: Verify the binary that will ship
+        run: python3 scripts/integration.py target/nautra
+      # Stripped after the suite, so what was tested and what ships differ
+      # only in symbols.
+      - name: Strip
+        run: |
+          before=$(wc -c < target/nautra)
+          strip target/nautra
+          echo "$before -> $(wc -c < target/nautra) bytes"
+          ./target/nautra version
+      - name: Package
+        run: |
+          name="nautra-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp target/nautra README.md LICENSE NOTICE "dist/$name/"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          (cd dist && shasum -a 256 "$name.tar.gz") > "dist/$name.tar.gz.sha256"
+          cat "dist/$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nautra-${{ matrix.target }}
+          path: |
+            dist/nautra-${{ matrix.target }}.tar.gz
+            dist/nautra-${{ matrix.target }}.tar.gz.sha256
+      # One example guest, for the image job to run inside the container.
+      - uses: actions/upload-artifact@v4
+        if: matrix.target == 'linux-x86_64'
+        with:
+          name: hello-guest
+          path: target/wasm/hello.wasm
+
+  # The container image, for both Linux architectures, made from the binaries
+  # the job above tested. Each is run before anything is pushed: the amd64
+  # one natively, the arm64 one under emulation.
+  image:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Lay the binaries out by architecture
+        run: |
+          mkdir -p dist/image/amd64 dist/image/arm64
+          tar -xzf artifacts/nautra-linux-x86_64/nautra-linux-x86_64.tar.gz -C artifacts
+          tar -xzf artifacts/nautra-linux-aarch64/nautra-linux-aarch64.tar.gz -C artifacts
+          cp artifacts/nautra-linux-x86_64/nautra dist/image/amd64/nautra
+          cp artifacts/nautra-linux-aarch64/nautra dist/image/arm64/nautra
+          file dist/image/*/nautra
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and run each architecture
+        run: |
+          for arch in amd64 arm64; do
+            docker buildx build --platform "linux/$arch" --load -t "nautra:check-$arch" .
+            docker run --rm --platform "linux/$arch" "nautra:check-$arch" version
+            said=$(docker run --rm --platform "linux/$arch" -v "$PWD/artifacts/hello-guest:/w:ro" "nautra:check-$arch" run /w/hello.wasm image)
+            echo "$arch: $said"
+            test "$said" = "hello, image"
+            test "$(docker run --rm --platform "linux/$arch" --entrypoint id "nautra:check-$arch" -u)" = 10001
+          done
+      - uses: docker/login-action@v3
+        if: env.PUBLISH == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push ghcr.io/aid-on/nautra
+        if: env.PUBLISH == 'true'
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          docker buildx build --platform linux/amd64,linux/arm64 --push \
+            --label "org.opencontainers.image.source=https://github.com/Aid-On/nautra" \
+            --label "org.opencontainers.image.version=$version" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.licenses=Apache-2.0" \
+            -t "ghcr.io/aid-on/nautra:$version" .
+
+  # Published as a prerelease. A release marked latest is one the install
+  # instructions hand to strangers; it is promoted by hand once something has
+  # installed it on each platform it names.
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [build, image]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: nautra-*
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd artifacts
+          cat nautra-*.tar.gz.sha256 > nautra-checksums.sha256
+          shasum -a 256 -c nautra-checksums.sha256
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --prerelease --generate-notes \
+            --title "nautra ${GITHUB_REF_NAME#v}" nautra-*.tar.gz nautra-checksums.sha256
