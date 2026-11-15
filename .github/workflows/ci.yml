@@ -55,3 +55,7 @@ jobs:
         run: python3 scripts/integration.py target/nautra
         env:
           NAUTRA_TEST_REGISTRY: localhost:5057
+      # The Dockerfiles in examples/platforms, built on the released image
+      # and run: what a hosted platform would be handed.
+      - name: Platform example images
+        run: bash scripts/check-example-images.sh
