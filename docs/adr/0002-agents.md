@@ -173,9 +173,9 @@ run the command in its own process: it starts itself once more
 (`nautra __native ENTRY`), and that copy judges the entry again, applies the
 request and waits, so the command's output is collected like any tool's.
 
-The other direction — a native agent running under Porta, using nautra's
-tools — is nautra publishing a composition's tools as an MCP server on
-stdio. It is not built yet.
+The other direction — an agent that is not Wasm, using nautra's tools — is
+nautra publishing a composition's tools as an MCP server: a file with `[mcp]`
+in place of `[agent]`, over HTTP ([ADR-0003](0003-platforms.md) §2).
 
 ## 8. Porta's guest protocol is not carried over
 
@@ -191,7 +191,8 @@ written for them is ported by making it speak MCP over HTTP.
 4. Checks, delegation, remote MCP. *(done)*
 5. Native commands as tools and checks, through Porta's sandbox, built in.
    *(done)*
-6. Publishing a composition's tools as an MCP server, for native agents.
+6. Publishing a composition's tools as an MCP server, for agents that run
+   elsewhere. *(done, over HTTP; see ADR-0003)*
 
 Organisation-wide concerns — collecting records centrally, policy on which
 images may be pulled and which grants and secrets may be given, signing

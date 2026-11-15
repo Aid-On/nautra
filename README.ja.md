@@ -213,6 +213,28 @@ env = ["MCP_URL=https://mcp.example.com/mcp", "MCP_TOOL=search"]
 secrets = ["MCP_TOKEN@mcp.example.com"]
 ```
 
+### 別の場所で動くエージェントにツールを公開する
+
+これらのツールを使うエージェントは、Wasm である必要も、Nautra の下で動いている必要もありません。`[agent]` の代わりに `[mcp]` を書いた構成ファイルは、ツール群を MCP サーバとして公開します。
+
+```toml
+[mcp]
+listen = "8000"            # PORT（このマシンのみ）か ADDRESS:PORT
+token = "MCP_TOKEN"        # 呼び出し側のベアラートークンを持つホストの環境変数
+audit = "calls.jsonl"
+
+[tools.read_file]
+image = "ghcr.io/you/read-file:v1"
+mounts = ["./ws:/work:ro"]
+```
+
+```console
+$ MCP_TOKEN=… nautra run -f tools.toml
+nautra: tools published at http://127.0.0.1:8000/mcp
+```
+
+呼び出しの扱いは、実行の中から呼ばれたときと同じです。引数をスキーマで検査し、`before` の検査を先に通し、ツール自身の権限で新しいインスタンスを起動し、呼び出しを記録します。アドレスに届く相手は誰でもツールを呼べるので、このマシンの外に公開するときは、誰が呼べるかを必ず書きます。`token` を指定するか、Nautra の手前で基盤が認証する場合に限って `open = true` と書きます。リクエストは `POST /mcp` への JSON-RPC です。詳しくは [ADR-0003](docs/adr/0003-platforms.md) を参照してください。
+
 ### ネイティブコマンド
 
 Nautra が閉じ込めるのは Wasm です。エージェントが git やコンパイラ、テストランナーのようなネイティブのプログラムを必要とするときは、ツールや検査の項目に `image` の代わりに `command` を書きます。Nautra はそれを、姉妹プロジェクト [Porta](https://github.com/almide/porta) のサンドボックスで閉じ込めます。このサンドボックスは Nautra に組み込まれているので、ほかに何もインストールする必要はありません。Porta は、ホストのカーネルでネイティブのプロセスを閉じ込めます。
@@ -359,7 +381,7 @@ OCI Distribution API に対応したレジストリなら、どれでも使え�
 
 **プレアルファです。** ここまでに書いた機能は動作し、macOS と CI 上の Linux で `scripts/integration.py` が検証しています。WASI 0.3 とその `wasi:http` は wasmtime でまだ実験的な扱いで、サービスの機能もその制約を受けます。push と pull はローカルの `registry:2` で検証済みですが、公開レジストリではまだ検証していません。
 
-エージェント向けの機能は、[ADR-0002](docs/adr/0002-agents.md) に書いた順番で作っています。残っているのは、構成ファイルのツール群を MCP サーバとして公開する機能です。Porta の下で動くネイティブのエージェントが、それらのツールを使えるようになります。
+[ADR-0002](docs/adr/0002-agents.md) に書いたエージェント向けの機能は実装済みです。エージェントの実行基盤に載せる話は [ADR-0003](docs/adr/0003-platforms.md) にまとめています。Nautra 側の動作は Linux の x86-64 と arm64 で検証していますが、各基盤の上ではまだ動かしていません。
 
 まだ無いもの：
 

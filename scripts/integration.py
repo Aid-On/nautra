@@ -439,6 +439,84 @@ mounts = ["{repo}:ro"]
     shutil.rmtree(held, ignore_errors=True)
 
 
+def published_checks(n, wasm, project):
+    """[mcp]: a composition's tools published as an MCP server, for an agent that runs elsewhere."""
+    port = free_port()
+    token = "caller-token-s3cr3t"
+    audit = project / "published.jsonl"
+    (project / "published.toml").write_text(f"""
+[mcp]
+listen = "{port}"
+token = "MCP_TOKEN"
+audit = "published.jsonl"
+
+[tools.upper]
+image = "{wasm('upper')}"
+description = "Uppercase a text."
+input = {{ type = "object", properties = {{ text = {{ type = "string" }} }}, required = ["text"], additionalProperties = false }}
+
+[tools.read_file]
+image = "{wasm('read_file')}"
+mounts = ["ws:/work:ro"]
+""")
+    file = project / "published.toml"
+    (project / "beyond.toml").write_text(f'[mcp]\nlisten = "0.0.0.0:{port}"\n[tools.upper]\nimage = "{wasm("upper")}"\n')
+    check("tools are not published beyond this machine without saying who may call", n("run", "-f", project / "beyond.toml"), 125, err="does not say who may call")
+    check("a published file's token must be set on the host", n("run", "-f", file), 125, err="MCP_TOKEN, which is not set")
+    check("a file that publishes tools takes nothing else on the line", n("run", "-f", file, "extra", env={"MCP_TOKEN": token}), 125, err="takes no other option or argument")
+
+    def ask(body, auth=token, method="POST", path="/mcp"):
+        headers = {"Content-Type": "application/json"}
+        if auth:
+            headers["Authorization"] = "Bearer " + auth
+        request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=None if body is None else json.dumps(body).encode(), headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=20) as reply:
+                return reply.status, reply.read().decode()
+        except urllib.error.HTTPError as error:
+            return error.code, error.read().decode()
+        except OSError as error:
+            return 0, str(error)
+
+    env = {"PATH": os.environ["PATH"], "HOME": str(n.home), "NAUTRA_HOME": str(n.home), "MCP_TOKEN": token}
+    server = subprocess.Popen([n.binary, "run", "-f", str(file)], env=env, stderr=subprocess.PIPE, text=True)
+    try:
+        for _ in range(100):
+            if ask({"jsonrpc": "2.0", "id": 0, "method": "ping"})[0]:
+                break
+            time.sleep(0.05)
+        status, body = ask({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
+        expect("published tools answer initialize", status == 200 and json.loads(body)["result"]["serverInfo"]["name"] == "nautra", body)
+        status, body = ask({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        names = sorted(t["name"] for t in json.loads(body)["result"]["tools"]) if status == 200 else []
+        expect("published tools are listed", names == ["read_file", "upper"], body)
+        status, body = ask({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "upper", "arguments": {"text": "tide"}}})
+        expect("a published tool is called", status == 200 and "TIDE" in body, body)
+        status, body = ask({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "read_file", "arguments": {"path": "../outside.txt"}}})
+        expect("a published tool keeps to its own mount", status == 200 and json.loads(body)["result"]["isError"] and "outside\n" not in body, body)
+        status, body = ask({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "upper", "arguments": {"text": 3}}})
+        expect("a published tool's arguments are checked", status == 200 and "is not of type" in body, body)
+        expect("a caller without the token is refused", ask({"jsonrpc": "2.0", "id": 6, "method": "tools/list"}, auth=None)[0] == 401)
+        expect("a caller with another token is refused", ask({"jsonrpc": "2.0", "id": 7, "method": "tools/list"}, auth=token + "x")[0] == 401)
+        expect("only POST is taken", ask(None, method="GET")[0] == 405)
+        expect("the tools are at /mcp", ask({"jsonrpc": "2.0", "id": 8, "method": "ping"}, path="/elsewhere")[0] == 404)
+        expect("a notification is accepted without an answer", ask({"jsonrpc": "2.0", "method": "notifications/initialized"})[0] == 202)
+    finally:
+        server.send_signal(signal.SIGTERM)
+        try:
+            code = server.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            code = -1
+        said = server.stderr.read()
+    expect("published tools stop cleanly when asked", code == 0, f"exit {code}: {said}")
+    expect("it says where the tools are", f"tools published at http://127.0.0.1:{port}/mcp" in said, said)
+    text = audit.read_text() if audit.exists() else ""
+    kinds = [(r["kind"], r["decision"], r.get("name")) for r in map(json.loads, text.splitlines())]
+    expect("published calls are recorded", ("tool", "allow", "upper") in kinds, repr(kinds))
+    expect("the record does not hold the caller's token", token not in text and token not in said)
+
+
 def compose_checks(n, wasm, work):
     """nautra.toml: a workload and the tools it may call, each an image with its own grants."""
     project = work / "project"
@@ -526,6 +604,7 @@ mounts = ["ws:/work:ro"]
     record_checks(n, project, env, asked, token)
     team_checks(n, wasm, project, env, port, tools)
     native_checks(n, wasm, project)
+    published_checks(n, wasm, project)
 
     started = n("run", "-d", "--name", "agent-bg", "-f", project / "agent.toml", "What does the note say?", env=env)
     check("a composition runs in the background", started, 0)

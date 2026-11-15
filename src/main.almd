@@ -342,7 +342,41 @@ local effect fn cmd_run(args: List[String]) -> Int = match args {
   _ => start_run(args)!,
 }
 
-local effect fn start_run(args: List[String]) -> Int = {
+// A composition that publishes its tools: serves them as an MCP server until
+// stopped. Each tool's whole request is prepared now, as for a run; the
+// caller's token is read from the host here and goes nowhere but the engine.
+local effect fn publish_tools(p: compose.Published) -> Int = {
+  let token = if p.token == "" then "" else {
+    let held = env.get(p.token) ?? ""
+    guard held != "" else err("[mcp] token names ${p.token}, which is not set on the host")!
+    held
+  }
+  var tools: List[Value] = []
+  for t in p.tools {
+    tools = tools + [tool_entry(t, p.audit, true, 0)!]
+  }
+  var checks: List[Value] = []
+  for k in p.checks {
+    checks = checks + [check_entry(k, p.audit, true)!]
+  }
+  let outcome = engine.run(value.object([
+    ("path", value.string("")),
+    ("listen", value.string(p.listen)),
+    ("token", value.string(token)),
+    ("audit", value.string(p.audit)),
+    ("tools", value.array(tools)),
+    ("checks", value.array(checks)),
+  ]))!
+  if outcome.error != "" then eprintln("nautra: ${outcome.error}")
+  outcome.exit_code
+}
+
+local effect fn start_run(args: List[String]) -> Int = match compose.published(args)! {
+  some(p) => publish_tools(p)!,
+  none => run_line(args)!,
+}
+
+local effect fn run_line(args: List[String]) -> Int = {
   let (expanded, composed) = compose.expand(args)!
   let line = grants.parse_run(expanded)!
   let mode = if line.grants.record == "" then "" else "record"
