@@ -1,0 +1,187 @@
+// SPDX-License-Identifier: Apache-2.0
+// The `sigv4` scheme: AWS Signature Version 4 (ADR-0004 §3).
+//
+// The signature AWS services ask for, and the one most S3-compatible stores
+// took over from it. The signing itself is the `sigv4` library's; this file
+// is what makes it a scheme: the grant's words, where the credentials are,
+// and which of a request's headers are signed.
+//
+//   sigv4@bedrock-runtime.us-east-1.amazonaws.com
+//   sigv4@objects.example.com,region=auto,service=s3,env=STORE
+//
+// `region` and `service` are read off an AWS host name and need writing only
+// where they cannot be. `env` is the prefix of the host variables that hold
+// the credentials (`AWS`, so AWS_ACCESS_KEY_ID and the rest, unless said),
+// so that two stores can be signed for with two keys.
+
+import datetime
+import env
+import secret
+import self.auth
+import sigv4
+
+local let WORDS = ["region", "service", "env"]
+
+// The headers a signature is written in.
+local let OWN = ["authorization", "x-amz-date", "x-amz-security-token", "x-amz-content-sha256"]
+
+// An AWS region ends in a hyphen and a number: us-east-1, us-gov-west-1.
+local fn looks_like_region(word: String) -> Bool = match string.last_index_of(word, "-") {
+  some(at) => {
+    let digits = string.drop(word, at + 1)
+    digits != "" and string.to_list(digits) |> list.all((c) => string.is_digit(c))
+  },
+  none => false,
+}
+
+// The name a service signs under, from the label its host name starts with.
+// They are the same but for a few; where this is wrong the service's refusal
+// names the right one, and `service=` says it.
+local fn signing_name(label: String) -> String = {
+  let plain = string.strip_suffix(label, "-fips") ?? label
+  if list.contains(["bedrock-runtime", "bedrock-agent", "bedrock-agent-runtime"], plain) then "bedrock" else plain
+}
+
+// The labels of an AWS host name before AWS's own, or none for a host that
+// is not AWS's.
+local fn aws_labels(host: String) -> List[String]? = {
+  let labels = string.split(string.to_lower(host), ".")
+  [["amazonaws", "com", "cn"], ["amazonaws", "com"], ["api", "aws"]]
+    |> list.find((suffix) => list.len(labels) > list.len(suffix) and list.drop(labels, list.len(labels) - list.len(suffix)) == suffix)
+    |> option.map((suffix) => list.take(labels, list.len(labels) - list.len(suffix)))
+}
+
+/// The (region, service) an AWS host name says: `SERVICE.REGION.amazonaws.com`
+/// and its variants (a bucket in front, `dualstack`, `-fips`, a VPC
+/// endpoint), and the global endpoints, which sign in us-east-1. None for
+/// any other host, and for an AWS one that does not say.
+fn place(host: String) -> (String, String)? = match aws_labels(host) {
+  none => none,
+  some(labels) => match list.find_index(list.reverse(labels), (label) => looks_like_region(label)) {
+    none => if list.len(labels) == 1 then some(("us-east-1", signing_name(list.first(labels) ?? ""))) else none,
+    some(from_end) => {
+      let at = list.len(labels) - 1 - from_end
+      let before = list.take(labels, at) |> list.filter((label) => label != "dualstack")
+      list.last(before) |> option.map((label) => (list.get(labels, at) ?? "", signing_name(label)))
+    },
+  },
+}
+
+/// The grant's words, checked and filled in: always region, service and env.
+fn complete(host: String, params: List[(String, String)]) -> List[(String, String)]! = {
+  match auth.unknown(params, WORDS) {
+    some(word) => err("sigv4 has no '${word}': its words are ${list.join(WORDS, ", ")}")!,
+    none => (),
+  }
+  let (read_region, read_service) = place(host) ?? ("", "")
+  let region = if auth.param(params, "region") != "" then auth.param(params, "region") else read_region
+  let service = if auth.param(params, "service") != "" then auth.param(params, "service") else read_service
+  guard region != "" and service != "" else err("sigv4@${host}: this host name does not say its region and service; write them, as in sigv4@${host},region=us-east-1,service=s3")
+  let prefix = if auth.param(params, "env") != "" then auth.param(params, "env") else "AWS"
+  [("region", region), ("service", service), ("env", prefix)]
+}
+
+local effect fn credentials(prefix: String) -> sigv4.Credentials = {
+  let access_name = "${prefix}_ACCESS_KEY_ID"
+  let secret_name = "${prefix}_SECRET_ACCESS_KEY"
+  let access = env.get(access_name) |> option.filter((v) => v != "") |> option.to_result("${access_name} is not set in the environment")!
+  let held = env.secret(secret_name)! |> option.filter((v) => secret.reveal(v) != "") |> option.to_result("${secret_name} is not set in the environment")!
+  let token = env.secret("${prefix}_SESSION_TOKEN")! |> option.filter((v) => secret.reveal(v) != "")
+  { access_key: access, secret_key: held, session_token: token }
+}
+
+/// Whether the host has the credentials to sign with.
+effect fn ready(params: List[(String, String)]) -> Unit = {
+  let _ = credentials(auth.param(params, "env"))!
+  ()
+}
+
+/// The signature of one request, made at `at` (Unix seconds). Signed beside
+/// the host and the date: the content type, and the headers the workload
+/// addressed to the service by name (`x-amz-…`). The rest travels unsigned,
+/// so that a header rewritten on the way does not break the signature.
+fn answer(q: auth.Question, keys: sigv4.Credentials, at: Int) -> auth.Answer = {
+  let signed = q.headers |> list.filter((h) => {
+    let (name, _) = h
+    let lower = string.to_lower(name)
+    (lower == "content-type" or string.starts_with(lower, "x-amz-")) and not list.contains(OWN, lower)
+  })
+  let request: sigv4.Request = { method: q.method, host: q.host, path: q.path, query: q.query, headers: signed, body: bytes.new() }
+  let made = sigv4.sign_payload(request, keys, auth.param(q.params, "region"), auth.param(q.params, "service"), at, q.body_sha256)
+  { remove: OWN, set: made.headers }
+}
+
+/// `answer`, with the host's credentials and the time now.
+effect fn reply(q: auth.Question) -> auth.Answer = {
+  let keys = credentials(auth.param(q.params, "env"))!
+  answer(q, keys, datetime.now())
+}
+
+test "an AWS host name says its region and service" {
+  assert_eq(place("bedrock-runtime.us-east-1.amazonaws.com"), some(("us-east-1", "bedrock")))
+  assert_eq(place("bedrock-agentcore.us-west-2.amazonaws.com"), some(("us-west-2", "bedrock-agentcore")))
+  assert_eq(place("s3.eu-west-1.amazonaws.com"), some(("eu-west-1", "s3")))
+  assert_eq(place("my.bucket.s3.eu-west-1.amazonaws.com"), some(("eu-west-1", "s3")))
+  assert_eq(place("s3.dualstack.us-west-2.amazonaws.com"), some(("us-west-2", "s3")))
+  assert_eq(place("kms-fips.us-gov-west-1.amazonaws.com"), some(("us-gov-west-1", "kms")))
+  assert_eq(place("DynamoDB.cn-north-1.amazonaws.com.cn"), some(("cn-north-1", "dynamodb")))
+  assert_eq(place("vpce-0a1b-xyz.bedrock-runtime.us-east-1.vpce.amazonaws.com"), some(("us-east-1", "bedrock")))
+  assert_eq(place("lambda.us-east-1.api.aws"), some(("us-east-1", "lambda")))
+  assert_eq(place("iam.amazonaws.com"), some(("us-east-1", "iam")))
+}
+
+test "a host name that does not say is not guessed at" {
+  assert_eq(place("objects.example.com"), none)
+  assert_eq(place("127.0.0.1"), none)
+  assert_eq(place("amazonaws.com"), none)
+  assert_eq(place("us-east-1.amazonaws.com"), none)
+  assert_eq(place("my-bucket.s3.amazonaws.com"), none)
+}
+
+test "the grant's words are filled in from the host, and written ones win" {
+  assert_eq(
+    complete("bedrock-runtime.us-east-1.amazonaws.com", []),
+    ok([("region", "us-east-1"), ("service", "bedrock"), ("env", "AWS")]),
+  )
+  assert_eq(
+    complete("objects.example.com", [("service", "s3"), ("region", "auto"), ("env", "STORE")]),
+    ok([("region", "auto"), ("service", "s3"), ("env", "STORE")]),
+  )
+  assert_eq(
+    complete("execute.us-east-1.amazonaws.com", [("service", "execute-api")]),
+    ok([("region", "us-east-1"), ("service", "execute-api"), ("env", "AWS")]),
+  )
+  assert(result.is_err(complete("objects.example.com", [])))
+  assert(result.is_err(complete("objects.example.com", [("region", "auto")])))
+  assert(result.is_err(complete("s3.eu-west-1.amazonaws.com", [("zone", "a")])))
+}
+
+test "a request is signed as AWS's own example is" {
+  let keys: sigv4.Credentials = { access_key: "AKIDEXAMPLE", secret_key: secret.new("wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"), session_token: none }
+  let q: auth.Question = {
+    scheme: "sigv4",
+    params: [("region", "us-east-1"), ("service", "iam"), ("env", "AWS")],
+    method: "GET",
+    host: "iam.amazonaws.com",
+    path: "/",
+    query: "Action=ListUsers&Version=2010-05-08",
+    headers: [
+      ("Content-Type", "application/x-www-form-urlencoded; charset=utf-8"),
+      ("user-agent", "not signed"),
+      ("authorization", "the workload's own, not signed either")
+    ],
+    body_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  }
+  let a = answer(q, keys, datetime.from_parts(2015, 8, 30, 12, 36, 0) ?? 0)
+  assert_eq(a.remove, OWN)
+  assert_eq(
+    a.set,
+    [
+      ("x-amz-date", "20150830T123600Z"),
+      (
+        "authorization",
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/iam/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7",
+      )
+    ],
+  )
+}

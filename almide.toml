@@ -22,8 +22,8 @@ native = ["porta_sandbox"]
 # Porta's develop branch, pinned to a commit by almide.lock; a tag once Porta
 # releases with the package.
 porta_sandbox = { git = "https://github.com/almide/porta", branch = "develop", subdir = "sandbox" }
-# AWS Signature Version 4, in pure Almide: what signs a request for a
-# destination granted with --sign (ADR-0004).
+# AWS Signature Version 4, in pure Almide: the signing behind the `sigv4`
+# scheme of --auth (ADR-0004, src/auth_sigv4.almd).
 sigv4 = { git = "https://github.com/O6lvl4/sigv4", tag = "v0.1.0" }
 
 # Almide builds a dependency from outside github.com/almide only when its

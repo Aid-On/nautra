@@ -206,7 +206,7 @@ def aws_signature(secret, method, host, path, query, headers, body, signed_names
 
 
 def sign_checks(n, wasm, project, tools):
-    """--sign: requests to a destination are signed by nautra; the guest holds nothing."""
+    """--auth: requests to a destination are authenticated by nautra as the host; the guest holds nothing."""
     access, secret, session = "AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "session-token-s3cr3t/+="
     seen = []
 
@@ -253,31 +253,40 @@ def sign_checks(n, wasm, project, tools):
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_address[1]
     keys = {"AWS_ACCESS_KEY_ID": access, "AWS_SECRET_ACCESS_KEY": secret}
-    grant = f"aws:us-east-1:bedrock@127.0.0.1:{port}"
+    # Not an AWS host name, so the region and the service are written.
+    grant = f"sigv4@127.0.0.1:{port},region=us-east-1,service=bedrock"
     audit = project / "signed.jsonl"
 
-    got = n("run", "--sign", grant, "--audit", audit, wasm("fetch"), f"http://127.0.0.1:{port}/model/a%3A0/x%20y?b=2&a=1%2F2", env=keys)
+    got = n("run", "--auth", grant, "--audit", audit, wasm("fetch"), f"http://127.0.0.1:{port}/model/a%3A0/x%20y?b=2&a=1%2F2", env=keys)
     check("a request to a signed destination is accepted by the service", got, 0, out="200 3 characters", absent=secret)
     expect("it was signed over host and date, for the region and service named", seen[-1:] and seen[-1]["names"] == ["host", "x-amz-date"] and (seen[-1]["region"], seen[-1]["service"]) == ("us-east-1", "bedrock"), repr(seen[-1:]))
     check("an unsigned request is refused by the service", n("run", "--allow-net", f"127.0.0.1:{port}", wasm("fetch"), f"http://127.0.0.1:{port}/"), 0, out="403")
-    replaced = n("run", "--sign", grant, "-e", "API_TOKEN=brought-from-elsewhere", wasm("fetch"), f"http://127.0.0.1:{port}/", env=keys)
+    replaced = n("run", "--auth", grant, "-e", "API_TOKEN=brought-from-elsewhere", wasm("fetch"), f"http://127.0.0.1:{port}/", env=keys)
     check("the guest's own authorization is replaced by the signature", replaced, 0, out="200 3 characters")
-    temporary = n("run", "--sign", grant, wasm("fetch"), f"http://127.0.0.1:{port}/", env={**keys, "AWS_SESSION_TOKEN": session})
+    temporary = n("run", "--auth", grant, wasm("fetch"), f"http://127.0.0.1:{port}/", env={**keys, "AWS_SESSION_TOKEN": session})
     check("temporary credentials sign", temporary, 0, out="200 3 characters", absent=session)
     expect("their session token is sent and signed", seen[-1]["token"] == session and "x-amz-security-token" in seen[-1]["names"], repr(seen[-1]))
-    check("the guest's environment holds no key", n("run", "--sign", grant, wasm("env"), env=keys), 0, out="(no environment)", absent=secret)
-    check("a signed destination is not opened to sockets", n("run", "--sign", grant, wasm("dial"), "127.0.0.1", port, env=keys), 1, err="permission denied")
-    check("a signed run needs the host's credentials", n("run", "--sign", grant, wasm("fetch"), f"http://127.0.0.1:{port}/"), 125, err="AWS_ACCESS_KEY_ID is not set")
-    check("a signed destination names a region and a service", n("run", "--sign", f"aws@127.0.0.1:{port}", wasm("env"), env=keys), 125, err="needs a region and a service")
-    check("only aws signs", n("run", "--sign", f"gcp:r:s@127.0.0.1:{port}", wasm("env"), env=keys), 125, err="the only signature nautra makes is aws")
+    check("the guest's environment holds no key", n("run", "--auth", grant, wasm("env"), env=keys), 0, out="(no environment)", absent=secret)
+    check("a signed destination is not opened to sockets", n("run", "--auth", grant, wasm("dial"), "127.0.0.1", port, env=keys), 1, err="permission denied")
+    check("a signed run needs the host's credentials", n("run", "--auth", grant, wasm("fetch"), f"http://127.0.0.1:{port}/"), 125, err="AWS_ACCESS_KEY_ID is not set")
+    check("a host name that does not say its region and service has them written", n("run", "--auth", f"sigv4@127.0.0.1:{port}", wasm("env"), env=keys), 125, err="does not say its region and service")
+    check("an AWS host name says them itself", n("run", "--auth", "sigv4@bedrock-runtime.us-east-1.amazonaws.com", wasm("env"), env=keys), 0, out="(no environment)")
+    check("a scheme has only its own words", n("run", "--auth", f"{grant},zone=a", wasm("env"), env=keys), 125, err="sigv4 has no 'zone'")
+    check("a scheme nautra does not know is refused by name", n("run", "--auth", f"kerberos@127.0.0.1:{port}", wasm("env"), env=keys), 125, err="is not a way nautra authenticates requests")
+    # A store that is not AWS's, with keys of its own beside AWS's.
+    store = {"STORE_ACCESS_KEY_ID": access, "STORE_SECRET_ACCESS_KEY": secret, "AWS_ACCESS_KEY_ID": "another", "AWS_SECRET_ACCESS_KEY": "another-secret"}
+    other_store = n("run", "--auth", f"sigv4@127.0.0.1:{port},region=auto,service=s3,env=STORE", wasm("fetch"), f"http://127.0.0.1:{port}/bucket/key", env=store)
+    check("the credentials are read from the variables the grant names", other_store, 0, out="200 3 characters")
+    expect("for the region and service it names", (seen[-1]["region"], seen[-1]["service"]) == ("auto", "s3") and "x-amz-content-sha256" in seen[-1]["names"], repr(seen[-1]))
+    check("and are missed by that name", n("run", "--auth", f"sigv4@127.0.0.1:{port},region=auto,service=s3,env=STORE", wasm("env"), env=keys), 125, err="STORE_ACCESS_KEY_ID is not set")
     text = audit.read_text()
     records = [json.loads(line) for line in text.splitlines()]
-    expect("the audit says the request was signed, and holds no key or signature", [r.get("signed") for r in records] == ["aws"] and secret not in text and "Signature" not in text, text)
+    expect("the audit names the scheme, and holds no key or signature", [r.get("auth") for r in records] == ["sigv4"] and secret not in text and "Signature" not in text, text)
 
     # An agent whose model wants signed requests: a body, a content type, and
     # nothing in the agent's hands.
     (project / "signed.toml").write_text(
-        f'[agent]\nimage = "{wasm("agent")}"\nsign = ["{grant}"]\n'
+        f'[agent]\nimage = "{wasm("agent")}"\nauth = ["{grant}"]\n'
         f'env = ["MODEL_URL=http://127.0.0.1:{port}/model/fixture/converse", "MODEL_NAME=fixture"]\n' + tools)
     before = len(seen)
     answered = n("run", "-f", project / "signed.toml", "say something", env=keys)
@@ -290,8 +299,8 @@ def sign_checks(n, wasm, project, tools):
     before = len(seen)
     check("it replays with no credentials", n("replay", record, cwd=project), 0, out="signed, and answered")
     expect("a replay asks the service nothing", len(seen) == before, f"{len(seen) - before} request(s)")
-    (project / "signed-native.toml").write_text(f'[agent]\nimage = "{wasm("hello")}"\n\n[tools.git]\ncommand = ["git", "status"]\nsign = ["{grant}"]\n')
-    check("a native tool cannot be signed for", n("run", "-f", project / "signed-native.toml", env=keys), 125, err="unknown key 'sign'")
+    (project / "signed-native.toml").write_text(f'[agent]\nimage = "{wasm("hello")}"\n\n[tools.git]\ncommand = ["git", "status"]\nauth = ["{grant}"]\n')
+    check("a native tool's requests are not authenticated for it", n("run", "-f", project / "signed-native.toml", env=keys), 125, err="unknown key 'auth'")
 
 
 def record_checks(n, project, env, asked, token):

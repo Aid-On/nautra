@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: Apache-2.0
+// What a scheme is (ADR-0004).
+//
+// A destination granted with `--auth SCHEME@HOST` has its requests
+// authenticated by nautra, as the host, on the way out. A scheme is one way
+// of doing that: a signature over the request, a token fetched and put on it.
+// Whatever it is, it is asked the same question and gives the same kind of
+// answer, so nothing outside a scheme's own file knows how it works — not
+// the engine, not the audit, not the option that names it.
+//
+// A scheme is three things (see authenticator.almd, which lists them):
+//
+//   complete(host, params)   the grant's words, checked and filled in from
+//                            the host name where they can be read off it
+//   ready(params)            whether the host has what the scheme needs, said
+//                            before the run starts
+//   answer(question, …)      the headers that authenticate one request
+
+// One request, as it is about to leave. `headers` are all of the workload's,
+// for the scheme to pick from. `body_sha256` is "" unless the scheme asked
+// for the body (`Resolved.body`): reading a body whole to hash it is what a
+// signature costs, and a scheme that only adds a token does not pay it.
+type Question = {
+  scheme: String,
+  params: List[(String, String)],
+  method: String,
+  host: String,
+  path: String,
+  query: String,
+  headers: List[(String, String)],
+  body_sha256: String,
+}
+
+// What to do to the request: drop `remove` (the headers that are the
+// scheme's to write, so that the workload cannot bring its own), then put on
+// `set`.
+type Answer = { remove: List[String], set: List[(String, String)] }
+
+// One of a grant's words, or "" when it was not written.
+fn param(params: List[(String, String)], key: String) -> String =
+  params |> list.find_map((p) => {
+    let (name, written) = p
+    if name == key then some(written) else none
+  }) ?? ""
+
+// The first of a grant's words that the scheme has no meaning for.
+fn unknown(params: List[(String, String)], known: List[String]) -> String? =
+  params |> list.find_map((p) => {
+    let (name, _) = p
+    if list.contains(known, name) then none else some(name)
+  })

@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Asking for a signature (ADR-0004).
+//! Asking how a request is authenticated (ADR-0004).
 //!
-//! A request to a destination granted with `--sign` is signed before it
-//! leaves. The signing is done in Almide (`src/signer.almd`), which this side
-//! cannot call, so nautra is started once more as `nautra __sign` and asked
-//! over a pipe: one line of JSON for a request, one line back. The copy is
-//! started at the first request that needs it and kept until nautra ends,
-//! when its input closes and it ends too.
+//! A request to a destination granted with `--auth` is authenticated, as the
+//! host, before it leaves. How is a scheme's business, and schemes are
+//! written in Almide (`src/authenticator.almd`), which this side cannot
+//! call. So nautra is started once more as `nautra __auth` and asked over a
+//! pipe: one line of JSON describing a request, one line back saying which
+//! headers to drop and which to put on. The copy is started at the first
+//! request that needs it and kept until nautra ends, when its input closes
+//! and it ends too.
 //!
-//! The copy finds the credentials itself. Nothing here holds a key.
+//! Nothing here knows a scheme, and nothing here holds a key: the copy finds
+//! the host's credentials itself.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -26,10 +29,16 @@ struct Copy {
 /// so runs served side by side can share it, one question at a time.
 static COPY: Mutex<Option<Copy>> = Mutex::new(None);
 
+/// What to do to a request: drop `remove`, then put on `set`.
+pub(super) struct Answer {
+    pub(super) remove: Vec<String>,
+    pub(super) set: Vec<(String, String)>,
+}
+
 fn start() -> Result<Copy, String> {
-    let program = std::env::current_exe().map_err(|error| format!("cannot find nautra's own binary to sign with: {error}"))?;
+    let program = std::env::current_exe().map_err(|error| format!("cannot find nautra's own binary to ask: {error}"))?;
     let mut child = Command::new(&program)
-        .arg("__sign")
+        .arg("__auth")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -37,7 +46,7 @@ fn start() -> Result<Copy, String> {
         .map_err(|error| format!("cannot start {}: {error}", program.display()))?;
     match (child.stdin.take(), child.stdout.take()) {
         (Some(input), Some(output)) => Ok(Copy { child, input, output: BufReader::new(output) }),
-        _ => Err("cannot talk to nautra's signing copy".into()),
+        _ => Err("cannot talk to nautra's answering copy".into()),
     }
 }
 
@@ -52,9 +61,9 @@ fn exchange(copy: &mut Copy, question: &str) -> std::io::Result<String> {
     Ok(answer)
 }
 
-/// The headers that sign the request `question` describes, or why there are
-/// none. Blocks while the copy answers.
-pub(super) fn ask(question: &Value) -> Result<Vec<(String, String)>, String> {
+/// How to authenticate the request `question` describes, or why it cannot
+/// be. Blocks while the copy answers.
+pub(super) fn ask(question: &Value) -> Result<Answer, String> {
     // serde_json writes no newline inside a document, so it is one line.
     let line = question.to_string();
     let mut held = COPY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -77,11 +86,14 @@ pub(super) fn ask(question: &Value) -> Result<Vec<(String, String)>, String> {
             }
         }
     }
-    let answer = answer.ok_or("nautra's signing copy stopped answering")?;
-    let answer: Value = serde_json::from_str(&answer).map_err(|_| "nautra's signing copy gave no answer")?;
+    let answer = answer.ok_or("nautra's answering copy stopped answering")?;
+    let answer: Value = serde_json::from_str(&answer).map_err(|_| "nautra's answering copy gave no answer")?;
     if let Some(reason) = answer["error"].as_str() {
         return Err(reason.to_owned());
     }
-    let headers = answer["headers"].as_array().ok_or("nautra's signing copy gave no headers")?;
-    Ok(headers.iter().filter_map(|pair| Some((pair[0].as_str()?.to_owned(), pair[1].as_str()?.to_owned()))).collect())
+    let set = answer["set"].as_array().ok_or("nautra's answering copy gave no headers")?;
+    Ok(Answer {
+        remove: answer["remove"].as_array().into_iter().flatten().filter_map(|name| Some(name.as_str()?.to_owned())).collect(),
+        set: set.iter().filter_map(|pair| Some((pair[0].as_str()?.to_owned(), pair[1].as_str()?.to_owned()))).collect(),
+    })
 }

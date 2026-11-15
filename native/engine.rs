@@ -24,6 +24,8 @@ use journal::Journal;
 use outbound::{Audit, Outbound};
 use tools::Tools;
 
+#[path = "engine/auth.rs"]
+mod auth;
 #[path = "engine/inspect.rs"]
 mod inspect;
 #[path = "engine/journal.rs"]
@@ -34,8 +36,6 @@ mod native;
 mod outbound;
 #[path = "engine/serve.rs"]
 mod serve;
-#[path = "engine/signer.rs"]
-mod signer;
 #[path = "engine/spawn.rs"]
 mod spawn;
 #[path = "engine/tools.rs"]

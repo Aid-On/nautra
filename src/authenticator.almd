@@ -1,0 +1,129 @@
+// SPDX-License-Identifier: Apache-2.0
+// Requests the host authenticates (ADR-0004): the schemes there are, and the
+// copy of nautra that answers for them.
+//
+// A destination granted with `--auth` has every request authenticated on the
+// way out. The request is in the engine, which cannot call Almide, so nautra
+// starts itself once more (`nautra __auth`) and the engine asks that copy
+// over a pipe: one line of JSON for a request, one line back saying which
+// headers to drop and which to put on.
+//
+// The copy is the only part of nautra that reads the host's credentials for
+// a scheme, so the question it is asked carries no key, and neither does the
+// request document of a run.
+//
+// To add a scheme: write its file after auth_sigv4.almd, and add it to the
+// three matches below. Nothing else changes — not the option, not the
+// engine, not the audit.
+
+import io
+import json
+import self.auth
+import self.auth_sigv4
+import self.grants
+
+let SCHEMES = ["sigv4"]
+
+// A grant with its words checked and filled in. `body` says whether the
+// scheme needs each request's body read whole and hashed.
+type Resolved = { scheme: String, host: grants.NetRule, params: List[(String, String)], body: Bool }
+
+local fn no_scheme(scheme: String) -> String =
+  "'${scheme}' is not a way nautra authenticates requests; it knows: ${list.join(SCHEMES, ", ")}"
+
+/// What a grant comes to, or why it cannot be granted.
+fn resolve(g: grants.AuthGrant) -> Resolved! = match g.scheme {
+  "sigv4" => Resolved { scheme: g.scheme, host: g.host, params: auth_sigv4.complete(g.host.host, g.params)!, body: true },
+  _ => err(no_scheme(g.scheme)),
+}
+
+/// Whether the host has what the grant's scheme needs, said before the run
+/// starts rather than at its first request.
+effect fn ready(r: Resolved) -> Unit = match r.scheme {
+  "sigv4" => auth_sigv4.ready(r.params)!,
+  _ => err(no_scheme(r.scheme))!,
+}
+
+local effect fn reply(q: auth.Question) -> auth.Answer = match q.scheme {
+  "sigv4" => auth_sigv4.reply(q)!,
+  _ => err(no_scheme(q.scheme))!,
+}
+
+local fn field(doc: Value, key: String) -> String! =
+  value.get(doc, key) |> option.to_result("the question has no ${key}")! |> value.as_string |> result.map_err((_) => "${key} is not a string")
+
+local fn pairs(doc: Value, key: String) -> List[(String, String)]! = {
+  let rows = value.get(doc, key) |> option.to_result("the question has no ${key}")! |> value.as_array |> result.map_err((_) => "${key} is not a list")!
+  rows |> list.map((row) => {
+    let cells = value.as_array(row) |> result.map_err((_) => "${key} holds something that is not a pair")!
+    let name = value.as_string(list.get(cells, 0) ?? value.null()) |> result.map_err((_) => "${key} holds something that is not a pair")!
+    let written = value.as_string(list.get(cells, 1) ?? value.null()) |> result.map_err((_) => "${key} holds something that is not a pair")!
+    (name, written)
+  })!
+}
+
+/// One line from the engine, read.
+fn question(text: String) -> auth.Question! = {
+  let doc = json.parse(text) |> result.map_err((_) => "the question is not JSON")!
+  auth.Question {
+    scheme: field(doc, "scheme")!,
+    params: pairs(doc, "params")!,
+    method: field(doc, "method")!,
+    host: field(doc, "host")!,
+    path: field(doc, "path")!,
+    query: field(doc, "query")!,
+    headers: pairs(doc, "headers")!,
+    body_sha256: field(doc, "body_sha256")!,
+  }
+}
+
+local fn rows(headers: List[(String, String)]) -> Value =
+  value.array(headers |> list.map((h) => {
+    let (name, written) = h
+    value.array([value.string(name), value.string(written)])
+  }))
+
+/// One line back to the engine.
+fn line(answered: Result[auth.Answer, String]) -> String = match answered {
+  ok(a) => json.stringify(value.object([("remove", value.array(a.remove |> list.map(value.string))), ("set", rows(a.set))])),
+  err(reason) => json.stringify(value.object([("error", value.string(reason))])),
+}
+
+local effect fn answered(text: String) -> auth.Answer = {
+  let q = question(text)!
+  reply(q)!
+}
+
+// `nautra __auth`: answers questions until its input ends, which is when the
+// nautra that started it does.
+effect fn run() -> Int = {
+  var more = true
+  while more {
+    match io.read_line() {
+      some(text) => println(line(answered(text))),
+      none => { more = false },
+    }
+  }
+  0
+}
+
+test "a grant is resolved by its scheme, and an unknown scheme is refused by name" {
+  let host = grants.NetRule { host: "bedrock-runtime.us-east-1.amazonaws.com", port: 443 }
+  let r = resolve(grants.AuthGrant { scheme: "sigv4", host: host, params: [] })!
+  assert_eq(r.params, [("region", "us-east-1"), ("service", "bedrock"), ("env", "AWS")])
+  assert(r.body)
+  assert_eq(
+    resolve(grants.AuthGrant { scheme: "kerberos", host: host, params: [] }),
+    err("'kerberos' is not a way nautra authenticates requests; it knows: sigv4"),
+  )
+}
+
+test "a question is read, and one that is not a question is answered with the reason" {
+  let q = question("{\"scheme\":\"sigv4\",\"params\":[[\"region\",\"r\"]],\"method\":\"GET\",\"host\":\"h\",\"path\":\"/\",\"query\":\"\",\"headers\":[[\"a\",\"b\"]],\"body_sha256\":\"\"}")!
+  assert_eq(q.params, [("region", "r")])
+  assert_eq(q.headers, [("a", "b")])
+  assert(result.is_err(question("not json")))
+  assert(result.is_err(question("{\"scheme\":\"sigv4\"}")))
+  assert_eq(line(err("no")), "{\"error\":\"no\"}")
+  assert_eq(line(ok(auth.Answer { remove: ["authorization"], set: [("x", "y")] })), "{\"remove\":[\"authorization\"],\"set\":[[\"x\",\"y\"]]}")
+}

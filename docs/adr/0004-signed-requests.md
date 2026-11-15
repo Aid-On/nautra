@@ -1,144 +1,180 @@
-# ADR-0004: Requests the host signs
+# ADR-0004: Requests the host authenticates
 
 Status: proposed, 2026-11-16
 
 A secret (ADR-0002) is a value: nautra puts it on a request where the guest
-wrote its placeholder. Some services take no such value. AWS wants every
-request signed (Signature Version 4): a keyed hash over the method, the path,
-the query, some headers, the body and the time, made with a key that is never
-sent. There is nothing for a placeholder to stand for, so ADR-0003 left
-"signed model requests" open. This decides it, for AWS first — it is what
-running an agent against Amazon Bedrock needs.
+wrote its placeholder. Much of what an agent has to reach takes no such
+value. AWS wants every request signed with a key that is never sent. Google
+Cloud and Azure want a short-lived token minted from a key, or handed out by
+the machine the code runs on. In each case there is nothing lasting for a
+placeholder to stand for, so ADR-0003 left "signed model requests" open.
 
-## 1. A destination is signed for, not a value handed over
+This decides the general thing — a destination whose requests nautra
+authenticates as the host — and builds one way of doing it, AWS's signature,
+because running an agent against Amazon Bedrock needs it first. The grant,
+the engine and the audit are written for any way; only one file knows AWS.
+
+## 1. A destination is authenticated to, not a value handed over
 
 ```toml
 [agent]
 image = "agent.wasm"
-sign = ["aws:us-east-1:bedrock@bedrock-runtime.us-east-1.amazonaws.com"]
+auth = ["sigv4@bedrock-runtime.us-east-1.amazonaws.com"]
 ```
 
-On the command line, `--sign aws:REGION:SERVICE@HOST[:PORT][,HOST…]`.
+On the command line, `--auth SCHEME@HOST[:PORT][,KEY=VALUE…]`.
 
 - **The guest holds nothing**, not even a placeholder. It sends the request
-  it would send to an open endpoint; nautra signs it on the way out. A guest
-  cannot ask for a signature, see one, or choose what is signed.
-- **Every request to the host is signed**, and only those. Naming the host is
-  also the grant to send HTTP there, as for a secret, and for the same
-  reason.
+  it would send to an open endpoint, and nautra authenticates it on the way
+  out. So the same agent binary runs against any provider: what changes is
+  a line of the file, not the workload.
+- **Every request to the host is authenticated**, and only those. Naming the
+  host is also the grant to send HTTP there, as for a secret, and for the
+  same reason.
 - **Over HTTPS only**, except to this machine's loopback.
-- **Region and service are written, not guessed.** The name a service signs
-  under is not always the first label of its host (`bedrock-runtime` signs
-  as `bedrock`), and a table of exceptions would be wrong the day a service
-  is added.
-- **The order is curl's.** Tools that sign for a caller agree on the two
-  words, region and service, and on little else: most take them as two named
-  options, and the one compact form in wide use is curl's
-  `--aws-sigv4 aws:amz:REGION:SERVICE`, which is also the order inside the
-  signature. That order is kept here, without `amz`. The two written the
-  other way round are refused, saying so, rather than left for the service
-  to refuse without a reason.
-- **`aws` is the only scheme.** The word is there so another can be added
-  without a new key.
+- **The scheme is a word, and its parameters are its own.** `SCHEME` says
+  how; `KEY=VALUE` pairs after the host are that scheme's words and no
+  one else's. Nothing about the option is shaped by one provider.
+- **One host to a grant.** Another host is another `--auth`.
 
 The same key works in a tool's table, with the tool's own destinations. A
-native command cannot be signed for (§5).
+native command's requests are not authenticated for it (§6).
 
-## 2. What is signed
+## 2. A scheme
 
-The request as it leaves: method, path and query as the guest wrote them, the
-whole body, and these headers:
+A scheme is one way of authenticating a request: a signature over it, a
+token fetched and put on it. It is three functions (`src/auth.almd`):
 
-- `host` and `x-amz-date`, always;
-- `x-amz-security-token`, when the credentials are temporary;
-- `content-type`, and every `x-amz-…` header the guest set (`x-amz-target`
-  is how some services name the operation).
+| | |
+|---|---|
+| `complete(host, params)` | the grant's words, checked, and filled in from the host name where they can be read off it |
+| `ready(params)` | whether the host has what the scheme needs — said before the run starts |
+| `answer(question)` | for one request: the headers to drop, and the headers to put on |
 
-Other headers travel unsigned, so a proxy that rewrites one does not break
-the signature.
+The question is the same for every scheme: the method, the host, the path,
+the query, the headers the guest wrote, and — only for a scheme that asks —
+the hash of the body. The answer is the same too. Because of that:
 
-`authorization`, `x-amz-date`, `x-amz-security-token` and
-`x-amz-content-sha256` are nautra's to write. A guest that sends its own has
-them replaced: it cannot bring a signature made elsewhere through a host
-nautra signs for.
+- **Nothing outside a scheme's file knows how it works.** The engine carries
+  `scheme` and `params` without reading them; it has no word of any
+  provider's in it. The option's parser reads a shape, not a meaning.
+- **A scheme pays only for what it uses.** A signature covers the body, so
+  the body is read whole and hashed before the request leaves, and one over
+  32 MiB is refused. A scheme that only adds a token says so, and its
+  requests stream as they always did.
+- **A scheme owns its headers.** The headers it names are dropped before its
+  own are put on, so a guest cannot bring credentials made elsewhere through
+  a host nautra answers for.
+- **Adding one is a file and three lines** (`src/authenticator.almd` lists
+  the schemes). The option, the engine, the audit and the record do not
+  change.
 
-The body is read whole before the request is sent, because its hash is part
-of the signature. A body over 32 MiB is refused. A request that streams its
-body therefore leaves at once rather than as it is written; the response
-streams as before.
+## 3. The first scheme: `sigv4`
 
-## 3. Where the signing happens
+AWS Signature Version 4 — named for the signature, not the company, because
+it is also what most S3-compatible object stores ask for.
 
-In nautra, in Almide, by the [`sigv4`](https://github.com/O6lvl4/sigv4)
-library — not in the engine's Rust.
+```text
+sigv4@bedrock-runtime.us-east-1.amazonaws.com
+sigv4@objects.example.com,region=auto,service=s3,env=STORE
+```
+
+- **`region` and `service` are read off an AWS host name** and need writing
+  only where they cannot be: a host that is not AWS's, or an AWS one that
+  does not say. A written word always wins. What is read is the shape AWS
+  host names have (`SERVICE.REGION.amazonaws.com`, with a bucket in front,
+  `dualstack`, `-fips`, a VPC endpoint; the global endpoints, which sign in
+  `us-east-1`), not a table of services. The name a service signs under is
+  its host's first label but for a few (`bedrock-runtime` signs as
+  `bedrock`); those few are listed, and where the list is behind, the
+  service's own refusal names the right word and `service=` says it. A host
+  name that does not say is refused, never guessed at.
+- **`env` is the prefix of the host variables holding the credentials**:
+  `AWS` unless written, so `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and
+  `AWS_SESSION_TOKEN` when the key is temporary. Two stores are signed for
+  with two keys by giving one of them another prefix.
+- **Signed**: the method, path and query as the guest wrote them, the whole
+  body, `host` and the date, the session token, `content-type`, and every
+  `x-amz-…` header the guest set (`x-amz-target` is how some services name
+  the operation). Other headers travel unsigned, so a proxy that rewrites
+  one does not break the signature.
+
+Other tools were looked at for a form to share. They agree on the two words,
+region and service, and on little else; most take them as two named options,
+which is what they are here, and reading them off the host name is what
+curl and AWS's own signing proxy do.
+
+## 4. Where it happens
+
+In nautra, in Almide — for `sigv4`, by the
+[`sigv4`](https://github.com/O6lvl4/sigv4) library — not in the engine's
+Rust.
 
 The engine is where the request is, and it cannot call Almide: Almide calls
 native code, not the other way. So nautra does here what it does for a native
-command: it starts itself once more (`nautra __sign`), and the engine asks
+command: it starts itself once more (`nautra __auth`), and the engine asks
 that copy over a pipe, one line per request. The copy is started at the first
-request that needs a signature and kept until nautra ends.
+request that needs it and kept until nautra ends.
 
 - **The copy finds the credentials, and is the only part that uses them.**
-  The engine sends it the request's shape (method, host, path, query, the
-  headers to sign, the body's hash, region and service) and gets headers
-  back. The secret key is not in the request document a run is started
-  with, and the engine is never handed it. (The process the engine runs in
-  still has the host's environment, as it does for any secret.)
-- **The copy is a function.** It reads no file, opens no connection, and
-  gives the same answer for the same question and the same second.
+  The key is not in the request document a run is started with, and the
+  engine is never handed it. (The process the engine runs in still has the
+  host's environment, as it does for any secret.)
+- **The copy lasts**, so a scheme that mints a token, or is handed
+  credentials that expire, can keep and renew them there without the engine
+  or the run knowing.
 
 The alternatives, and why not:
 
-- *Signing in the engine's Rust.* A hundred lines, and a second
-  implementation of something nautra's own language now has a tested library
-  for. Where credentials come from (§4) would be written in Rust too.
-- *A signer that is a Wasm image*, run by the engine the way a tool is.
-  It would let anyone add a scheme, which is worth having. It also asks how
-  such an image is granted a key and trusted with one, which is a design of
-  its own; nothing here is in its way.
+- *Authenticating in the engine's Rust.* Each scheme would be written twice
+  over the years — once where the policy is, once where the request is —
+  and the engine would fill with providers.
+- *A scheme that is a Wasm image*, run by the engine the way a tool is. It
+  would let anyone add a scheme without building nautra, which is worth
+  having, and the question and answer of §2 are already what such an image
+  would be asked and say. It also asks how an image is granted a key and
+  trusted with one, which is a design of its own.
 
-## 4. Where the credentials come from
+## 5. Where the credentials come from
 
-From the host's environment, by the names AWS uses: `AWS_ACCESS_KEY_ID`,
-`AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` when the key is temporary.
-A run that names a signed destination and finds no key is refused before it
-starts.
+From the host, by the scheme's own conventions; for `sigv4`, the variables of
+§3. A run that names an authenticated destination and finds the host
+without them is refused before it starts.
 
-They are the host's variables. The guest's environment starts empty, as
-always; `sign` does not copy them in.
+They are the host's. The guest's environment starts empty, as always;
+`--auth` does not copy anything in.
 
-Not built: the credentials a platform hands a container by its role — the
-container credentials endpoint (`AWS_CONTAINER_CREDENTIALS_FULL_URI`) and
-the instance metadata service. They expire and are renewed, which is why the
-copy that signs is the one that finds them: it can fetch and renew without
-the engine or the run knowing. On AgentCore Runtime this is the step that
-lets an agent use its execution role with no key in the image or its
-configuration.
+Not built: the credentials a platform hands a workload by its role, with no
+key anywhere — for AWS, the container credentials endpoint and the instance
+metadata service. On AgentCore Runtime that is the step that lets an agent
+use its execution role. It belongs to the scheme, in the copy (§4).
 
-## 5. The record, the audit, and what is refused
+## 6. The record, the audit, and what is refused
 
-- **The audit** line of a signed request carries `"signed": "aws"`. It never
-  held a header value and still does not.
+- **The audit** line of an authenticated request names the scheme:
+  `"auth": "sigv4"`. It never held a header value and still does not.
 - **A record** (`--record`) identifies a request by its method, its URL and
-  its body's hash. Headers are not part of it, so a signature is not; a
-  replay sends nothing and needs no credentials.
-- **A native tool or check** is refused `sign`. Its requests leave through
-  Porta's proxy, which puts a value on a request and does not sign one.
-- **A signature that cannot be made** — the copy cannot be started, the
-  credentials are gone, the body is too large — refuses the request, with
-  the reason in the audit. Nothing is ever sent unsigned to a host that is
-  signed for.
+  its body's hash. Headers are not part of it, so no credential is; a replay
+  sends nothing, asks for nothing and needs no credentials.
+- **A native tool or check** is refused `auth`. Its requests leave through
+  Porta's proxy, which puts a value on a request and does nothing else.
+- **A request that cannot be authenticated** — the copy cannot be started,
+  the credentials are gone, the body is too large — is refused, with the
+  reason in the audit. Nothing is ever sent bare to a host that is
+  authenticated to.
 
 ## Not decided yet
 
-- **Role credentials** (§4).
-- **Other schemes.** Google Cloud and Azure authenticate with a bearer token
-  that is minted from a key and expires. That is a secret whose value is
-  fetched, not a signature, and belongs with secrets.
-- **S3-sized bodies.** S3 accepts a request whose body is not signed
-  (`UNSIGNED-PAYLOAD`), which would let an upload stream.
-- **Signers as images** (§3).
+- **More schemes.** The ones in sight: a Google Cloud access token and an
+  Azure one (each minted, or taken from the machine's metadata service), and
+  an OAuth client-credentials grant. Each is a file under §2; none is built.
+- **Role credentials** for `sigv4` (§5).
+- **A scheme chosen by the host name**, so that `--auth HOST` alone would
+  do. Possible once there is more than one scheme to choose between.
+- **Bodies too large to hash.** S3 accepts a request whose body is not
+  signed, which would let an upload stream.
+- **Schemes as images** (§4).
 
-None of this has been run against AWS yet. What is tested is that the
-signature a server receives is the one AWS's algorithm gives for the request
-it received.
+None of this has been run against AWS, or any provider, yet. What is tested
+is that the signature a server receives is the one the algorithm gives for
+the request it received.

@@ -16,9 +16,12 @@ type EnvGrant = { name: String, value: String? }
 // HTTP requests to these destinations only.
 type SecretGrant = { name: String, hosts: List[NetRule] }
 
-// Destinations whose requests nautra signs on the way out (ADR-0004). The
-// workload holds nothing; `scheme` is "aws", the only one.
-type SignGrant = { scheme: String, region: String, service: String, hosts: List[NetRule] }
+// A destination whose requests nautra authenticates on the way out, as the
+// host (ADR-0004). The workload holds nothing. `scheme` names how — a
+// signature, a token — and `params` are that scheme's own words, as written:
+// what they mean is the scheme's to say (authenticator.almd), not this
+// file's.
+type AuthGrant = { scheme: String, host: NetRule, params: List[(String, String)] }
 
 type Grants = {
   mounts: List[Mount],
@@ -32,7 +35,7 @@ type Grants = {
   // The address an HTTP service is published on, or "" for an ordinary run.
   publish: String,
   secrets: List[SecretGrant],
-  signs: List[SignGrant],
+  auths: List[AuthGrant],
   // A file every decision at the run's boundary is appended to, or "".
   audit: String,
   // A file the run's exchanges are written to, so it can be replayed, or "".
@@ -65,7 +68,7 @@ fn nothing() -> Grants = Grants {
   stdin: false,
   publish: "",
   secrets: [],
-  signs: [],
+  auths: [],
   audit: "",
   record: "",
 }
@@ -147,38 +150,27 @@ fn parse_secret(text: String) -> SecretGrant! = {
   SecretGrant { name: name, hosts: hosts }
 }
 
-// An AWS region ends in a hyphen and a number (us-east-1, us-gov-west-1); no
-// service's signing name does. Only used to tell the two apart: a region
-// that is not AWS's (an S3-compatible service's `auto`) is taken as written.
-local fn looks_like_region(word: String) -> Bool = match string.last_index_of(word, "-") {
-  some(at) => {
-    let digits = string.drop(word, at + 1)
-    digits != "" and string.to_list(digits) |> list.all((c) => string.is_digit(c))
-  },
-  none => false,
-}
-
-// `aws:REGION:SERVICE@HOST[:PORT][,HOST…]`. The port is 443 unless written.
-fn parse_sign(text: String) -> SignGrant! = {
-  let how = "write aws:REGION:SERVICE@HOST, for example aws:us-east-1:bedrock@bedrock-runtime.us-east-1.amazonaws.com"
-  let (signer, places) = string.split_once(text, "@") |> option.to_result("'${text}' names no host to sign for: ${how}")!
-  guard places != "" else err("'${text}' names no host to sign for: ${how}")
-  let words = string.split(signer, ":")
-  let scheme = list.get(words, 0) ?? ""
-  guard scheme == "aws" else err("'${text}': the only signature nautra makes is aws: ${how}")
-  let region = list.get(words, 1) ?? ""
-  let service = list.get(words, 2) ?? ""
-  guard list.len(words) == 3 and region != "" and service != "" else err("'${text}' needs a region and a service: ${how}")
-  // The order is curl's (`--aws-sigv4 aws:amz:REGION:SERVICE`) and the
-  // signature's own. Written the other way round it would sign, and be
-  // refused by the service with no word about why.
-  guard not (looks_like_region(service) and not looks_like_region(region)) else err("'${text}' has the region and the service the wrong way round: write aws:${service}:${region}@${places}")
-  let hosts = string.split(places, ",") |> list.map((place) => {
-    let rule = parse_net(place)!
-    guard rule.host != "*" else err("requests are signed for named hosts, not for '*'")
-    { ...rule, port: if rule.port == 0 then 443 else rule.port }
+// `SCHEME@HOST[:PORT][,KEY=VALUE…]`. The port is 443 unless written. Only
+// the shape is read here; which schemes there are, and what a scheme's
+// parameters mean, is decided where the run is prepared.
+fn parse_auth(text: String) -> AuthGrant! = {
+  let how = "write SCHEME@HOST, for example sigv4@bedrock-runtime.us-east-1.amazonaws.com"
+  let (scheme, rest) = string.split_once(text, "@") |> option.to_result("'${text}' names no host to authenticate to: ${how}")!
+  guard scheme != "" and rest != "" else err("'${text}' names no scheme or no host: ${how}")
+  let parts = string.split(rest, ",")
+  let rule = parse_net(list.first(parts) ?? "")!
+  guard rule.host != "*" else err("requests are authenticated to a named host, not to '*'")
+  let params = list.drop(parts, 1) |> list.map((part) => {
+    let (key, written) = string.split_once(part, "=") |> option.to_result("'${part}' in '${text}' is not KEY=VALUE; for another host, give the option again")!
+    guard key != "" and written != "" else err("'${part}' in '${text}' is not KEY=VALUE")
+    (key, written)
   })!
-  SignGrant { scheme: scheme, region: region, service: service, hosts: hosts }
+  let keys = params |> list.map((p) => {
+    let (key, _) = p
+    key
+  })
+  guard list.len(list.unique(keys)) == list.len(keys) else err("'${text}' says the same thing twice")
+  AuthGrant { scheme: scheme, host: { ...rule, port: if rule.port == 0 then 443 else rule.port }, params: params }
 }
 
 local fn scaled(text: String, units: List[(String, Int)], what: String) -> Int! = {
@@ -205,7 +197,7 @@ local fn with_value(g: Grants, flag: String, text: String) -> Grants! = match fl
   "--allow-net" => if text == "*" then { ...g, net_all: true } else { ...g, net: g.net + [parse_net(text)!] },
   "-p" | "--publish" => { ...g, publish: parse_publish(text)! },
   "--secret" => { ...g, secrets: g.secrets + [parse_secret(text)!] },
-  "--sign" => { ...g, signs: g.signs + [parse_sign(text)!] },
+  "--auth" => { ...g, auths: g.auths + [parse_auth(text)!] },
   "--audit" => { ...g, audit: text },
   "--record" => { ...g, record: text },
   "-m" | "--memory" => { ...g, memory_bytes: parse_size(text)! },
@@ -238,7 +230,7 @@ fn option_count(args: List[String]) -> Int = {
 }
 
 local fn takes_value(flag: String) -> Bool =
-  list.contains(["-v", "--volume", "-e", "--env", "--allow-net", "-p", "--publish", "--secret", "--sign", "--audit", "--record", "-m", "--memory", "--timeout", "--fuel"], flag)
+  list.contains(["-v", "--volume", "-e", "--env", "--allow-net", "-p", "--publish", "--secret", "--auth", "--audit", "--record", "-m", "--memory", "--timeout", "--fuel"], flag)
 
 // Options come before the image; everything after it belongs to the guest.
 fn is_run_name(text: String) -> Bool =
@@ -391,19 +383,23 @@ test "options are counted with their values" {
   assert_eq(option_count(["-d", "--name"]), 2)
 }
 
-test "a signed destination names its scheme, region and service" {
+test "an authenticated destination names a scheme, a host, and the scheme's own words" {
   assert_eq(
-    parse_sign("aws:us-east-1:bedrock@bedrock-runtime.us-east-1.amazonaws.com"),
-    ok(SignGrant { scheme: "aws", region: "us-east-1", service: "bedrock", hosts: [NetRule { host: "bedrock-runtime.us-east-1.amazonaws.com", port: 443 }] }),
+    parse_auth("sigv4@bedrock-runtime.us-east-1.amazonaws.com"),
+    ok(AuthGrant { scheme: "sigv4", host: NetRule { host: "bedrock-runtime.us-east-1.amazonaws.com", port: 443 }, params: [] }),
   )
-  assert_eq(parse_sign("aws:r:s@a.example,127.0.0.1:8080")!.hosts, [NetRule { host: "a.example", port: 443 }, NetRule { host: "127.0.0.1", port: 8080 }])
-  assert(result.is_err(parse_sign("aws:us-east-1:bedrock")))
-  assert(result.is_err(parse_sign("aws:us-east-1@host")))
-  assert(result.is_err(parse_sign("aws::bedrock@host")))
-  assert(result.is_err(parse_sign("gcp:r:s@host")))
-  assert(result.is_err(parse_sign("aws:r:s@*")))
-  assert_eq(parse_sign("aws:bedrock:us-east-1@h.example"), err("'aws:bedrock:us-east-1@h.example' has the region and the service the wrong way round: write aws:us-east-1:bedrock@h.example"))
-  assert(result.is_err(parse_sign("aws:s3:us-gov-west-1@h.example")))
-  assert_eq(parse_sign("aws:auto:s3@h.example")!.region, "auto")
-  assert_eq(list.len(parse_run(["--sign", "aws:r:s@a.example", "app"])!.grants.signs), 1)
+  assert_eq(
+    parse_auth("sigv4@127.0.0.1:9000,region=auto,service=s3"),
+    ok(AuthGrant { scheme: "sigv4", host: NetRule { host: "127.0.0.1", port: 9000 }, params: [("region", "auto"), ("service", "s3")] }),
+  )
+  // Any scheme's shape is read; whether there is such a scheme is not asked here.
+  assert_eq(parse_auth("other@h.example,a=b")!.scheme, "other")
+  assert(result.is_err(parse_auth("sigv4")))
+  assert(result.is_err(parse_auth("@h.example")))
+  assert(result.is_err(parse_auth("sigv4@")))
+  assert(result.is_err(parse_auth("sigv4@*")))
+  assert(result.is_err(parse_auth("sigv4@a.example,b.example")))
+  assert(result.is_err(parse_auth("sigv4@a.example,region=")))
+  assert(result.is_err(parse_auth("sigv4@a.example,region=a,region=b")))
+  assert_eq(list.len(parse_run(["--auth", "sigv4@a.example", "app"])!.grants.auths), 1)
 }
