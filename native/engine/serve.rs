@@ -52,6 +52,10 @@ fn serve(request: Value) -> Result<Value, String> {
         Some(path) if !path.is_empty() => path.to_owned(),
         _ => return publish_tools(address, &request),
     };
+    // A workload that ends, published: run once for each request.
+    if request["invoke"] == json!(true) {
+        return publish_agent(address, &request);
+    }
     let bytes = std::fs::read(&path).map_err(|error| format!("cannot read {path}: {error}"))?;
     if !inspect::is_component(&bytes) {
         return Err("-p publishes an HTTP service, and this is a core module with no HTTP handler".into());
@@ -249,6 +253,13 @@ async fn respond(handler: ProxyHandler<Serving>, request: hyper::Request<Incomin
     }
 }
 
+/// What is published when no HTTP component is: a composition's tools, or a
+/// workload that ends, run once for each request.
+enum Published {
+    Tools(Arc<Tools>),
+    Agent(Value),
+}
+
 /// A composition's tools published as an MCP server: the caller is whoever
 /// connects, where in a run it is the workload. Each call is the same fresh,
 /// captured run under the tool's own grants, checked and recorded the same
@@ -256,23 +267,43 @@ async fn respond(handler: ProxyHandler<Serving>, request: hyper::Request<Incomin
 fn publish_tools(address: SocketAddr, request: &Value) -> Result<Value, String> {
     let audit = Audit::of(request)?;
     let tools = Tools::of(request, audit, None)?.ok_or("there are no tools to publish")?;
+    publish(address, request, Published::Tools(tools), "tools published at", "/mcp")
+}
+
+/// A workload that ends, published: each POST is one whole run of it — its
+/// tools and checks with it — given the request body on stdin, and answered
+/// with what it wrote. Nothing is kept from one request to the next.
+fn publish_agent(address: SocketAddr, request: &Value) -> Result<Value, String> {
+    // A schema that is not one, or an audit file that cannot be opened, is
+    // said now rather than on the first request.
+    Tools::of(request, Audit::of(request)?, None)?;
+    let mut each = request.clone();
+    if let Some(fields) = each.as_object_mut() {
+        fields.remove("invoke");
+        fields.remove("token");
+        fields.insert("listen".into(), json!(""));
+    }
+    publish(address, request, Published::Agent(each), "each POST runs the workload:", "/invocations")
+}
+
+fn publish(address: SocketAddr, request: &Value, what: Published, says: &'static str, path: &'static str) -> Result<Value, String> {
     let token = request["token"].as_str().filter(|token| !token.is_empty()).map(str::to_owned);
-    wasmtime_wasi::runtime::in_tokio(listen_for_tools(address, tools, Arc::new(token)))?;
+    wasmtime_wasi::runtime::in_tokio(listen_for(address, Arc::new(what), Arc::new(token), says, path))?;
     Ok(json!({ "exit_code": 0 }))
 }
 
-async fn listen_for_tools(address: SocketAddr, tools: Arc<Tools>, token: Arc<Option<String>>) -> Result<(), String> {
+async fn listen_for(address: SocketAddr, what: Arc<Published>, token: Arc<Option<String>>, says: &str, path: &str) -> Result<(), String> {
     let listener = tokio::net::TcpListener::bind(address).await.map_err(|error| format!("cannot listen on {address}: {error}"))?;
     let bound = listener.local_addr().map_err(|error| error.to_string())?;
-    eprintln!("nautra: tools published at http://{bound}/mcp");
+    eprintln!("nautra: {says} http://{bound}{path}");
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|error| error.to_string())?;
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let Ok((stream, _)) = accepted else { continue };
-                let (tools, token) = (tools.clone(), token.clone());
+                let (what, token) = (what.clone(), token.clone());
                 tokio::spawn(async move {
-                    let service = hyper::service::service_fn(move |request| answer_mcp(tools.clone(), token.clone(), request));
+                    let service = hyper::service::service_fn(move |request| answer(what.clone(), token.clone(), request));
                     let connection = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(stream), service);
                     let _ = connection.await;
                 });
@@ -290,35 +321,58 @@ fn presents(headers: &http::HeaderMap, token: &str) -> bool {
     given.len() == token.len() && given.bytes().zip(token.bytes()).fold(0u8, |differs, (a, b)| differs | (a ^ b)) == 0
 }
 
-async fn answer_mcp(tools: Arc<Tools>, token: Arc<Option<String>>, request: hyper::Request<Incoming>) -> Result<hyper::Response<http_body_util::Full<Bytes>>, std::convert::Infallible> {
+type Reply = hyper::Response<http_body_util::Full<Bytes>>;
+
+fn reply_with(status: http::StatusCode, kind: &'static str, body: Vec<u8>) -> Reply {
+    let mut response = hyper::Response::new(http_body_util::Full::new(Bytes::from(body)));
+    *response.status_mut() = status;
+    response.headers_mut().insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static(kind));
+    response
+}
+
+async fn answer(what: Arc<Published>, token: Arc<Option<String>>, request: hyper::Request<Incoming>) -> Result<Reply, std::convert::Infallible> {
     use http_body_util::BodyExt;
-    let plain = |status: http::StatusCode, text: &str| {
-        let mut response = hyper::Response::new(http_body_util::Full::new(Bytes::from(text.to_owned())));
-        *response.status_mut() = status;
-        response
-    };
-    if !matches!(request.uri().path(), "/mcp" | "/") {
-        return Ok(plain(http::StatusCode::NOT_FOUND, "the tools are at /mcp\n"));
+    let plain = |status: http::StatusCode, text: &str| reply_with(status, "text/plain; charset=utf-8", format!("{text}\n").into_bytes());
+    // Whether this process is up, for whatever started it. It says nothing
+    // about the tools or the workload and runs nothing, so it asks no token.
+    if request.method() == http::Method::GET && request.uri().path() == "/ping" {
+        return Ok(reply_with(http::StatusCode::OK, "application/json", br#"{"status":"Healthy"}"#.to_vec()));
+    }
+    if matches!(*what, Published::Tools(_)) && !matches!(request.uri().path(), "/mcp" | "/") {
+        return Ok(plain(http::StatusCode::NOT_FOUND, "the tools are at /mcp"));
     }
     if request.method() != http::Method::POST {
-        let mut response = plain(http::StatusCode::METHOD_NOT_ALLOWED, "MCP requests are POSTed here\n");
+        let mut response = plain(http::StatusCode::METHOD_NOT_ALLOWED, "requests are POSTed here");
         response.headers_mut().insert(http::header::ALLOW, http::HeaderValue::from_static("POST"));
         return Ok(response);
     }
     if let Some(token) = token.as_deref() {
         if !presents(request.headers(), token) {
-            let mut response = plain(http::StatusCode::UNAUTHORIZED, "a bearer token is required\n");
+            let mut response = plain(http::StatusCode::UNAUTHORIZED, "a bearer token is required");
             response.headers_mut().insert(http::header::WWW_AUTHENTICATE, http::HeaderValue::from_static("Bearer"));
             return Ok(response);
         }
     }
     let body = match http_body_util::Limited::new(request.into_body(), super::tools::MAX_BYTES).collect().await {
         Ok(body) => body.to_bytes(),
-        Err(_) => return Ok(plain(http::StatusCode::PAYLOAD_TOO_LARGE, "the request is too large\n")),
+        Err(_) => return Ok(plain(http::StatusCode::PAYLOAD_TOO_LARGE, "the request is too large")),
     };
-    let answer = tools.answer(&body).await;
-    let mut response = hyper::Response::new(http_body_util::Full::new(Bytes::from(answer.body)));
-    *response.status_mut() = http::StatusCode::from_u16(answer.status).unwrap_or(http::StatusCode::OK);
-    response.headers_mut().insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
-    Ok(response)
+    Ok(match &*what {
+        Published::Tools(tools) => {
+            let answer = tools.answer(&body).await;
+            reply_with(http::StatusCode::from_u16(answer.status).unwrap_or(http::StatusCode::OK), "application/json", answer.body)
+        }
+        Published::Agent(each) => {
+            let outcome = super::tools::run_tool(each.clone(), body.to_vec()).await;
+            if outcome.exit_code == 0 {
+                // What the workload wrote is the answer, as it is. It is
+                // called JSON when it is.
+                let kind = if serde_json::from_str::<Value>(&outcome.stdout).is_ok() { "application/json" } else { "text/plain; charset=utf-8" };
+                reply_with(http::StatusCode::OK, kind, outcome.stdout.into_bytes())
+            } else {
+                let said = json!({ "error": super::tools::said(&outcome), "exit_code": outcome.exit_code });
+                reply_with(http::StatusCode::INTERNAL_SERVER_ERROR, "application/json", said.to_string().into_bytes())
+            }
+        }
+    })
 }

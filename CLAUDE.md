@@ -19,7 +19,7 @@ tools over MCP.
 | `src/store.almd` | the local store, an OCI image layout |
 | `src/image.almd` | Nautrafile, building an image, what an image asks for |
 | `src/registry.almd` | OCI Distribution: pull, push, authentication |
-| `src/compose.almd` | `nautra.toml`: a workload and its tools, read into `run` options; or, with `[mcp]`, tools published with no workload |
+| `src/compose.almd` | `nautra.toml`: a workload and its tools, read into `run` options; or, with `[mcp]`, tools published with no workload; `[invoke]`, a workload run once per request |
 | `src/native.almd` | a native tool or check: nautra's grants turned into one request to Porta's sandbox (`porta_sandbox`, a dependency), and the hidden `__native` entry that applies it |
 | `src/runs.almd` | background runs: the record, the log, stop and remove |
 | `src/engine.almd` | every `@extern` into the native side |
@@ -28,7 +28,7 @@ tools over MCP.
 | `native/engine/journal.rs` | `--record`: the exchanges of a run, replayed or resumed |
 | `native/engine/native.rs` | starts nautra once more for a native tool or check and collects its output |
 | `native/engine/tools.rs` | the MCP endpoint at `tools.nautra`; a tool call is a captured run |
-| `native/engine/serve.rs` | an HTTP component served on a published address (`-p`); a composition's tools served as MCP (`[mcp]`) |
+| `native/engine/serve.rs` | an HTTP component served on a published address (`-p`); a composition's tools served as MCP (`[mcp]`); a workload run once per request (`[invoke]`) |
 | `native/engine/spawn.rs` | `run -d`: nautra started once more with no terminal |
 | `native/engine/inspect.rs` | what a `.wasm` file is, without compiling it |
 | `native/engine/upload.rs` | stopgap: a byte-exact request body (see ADR-0001 §3) |
@@ -69,8 +69,8 @@ NAUTRA_TEST_REGISTRY=localhost:5057 python3 scripts/integration.py target/nautra
   copied here; an entry the sandbox cannot hold to its words is refused,
   never run more openly. Nothing Wasm may come to need it.
 - A name without a registry is never sent anywhere.
-- Tools are never published beyond loopback without the file saying who
-  may call: a token, or `open = true`.
+- Tools and agents are never published beyond loopback without the file
+  saying who may call: a token, or `open = true`.
 - An exchange a record shows as begun and not ended is never repeated.
 - A secret's real value exists only in the host process: the guest holds a
   placeholder, and no record, log or run file holds the value.

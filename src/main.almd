@@ -243,10 +243,32 @@ local effect fn whole_request(line: grants.RunLine, composed: compose.Compositio
   }
 }
 
+// What `[invoke]` adds to a request: the address the workload is published
+// on, to be run once for each request, and the callers' token, read from the
+// host here and given to nothing but the engine.
+local effect fn invoked(composed: compose.Composition?) -> Value? = match composed {
+  some(c) if c.invoke != "" => {
+    let token = if c.invoke_token == "" then "" else {
+      let held = env.get(c.invoke_token) ?? ""
+      guard held != "" else err("[invoke] token names ${c.invoke_token}, which is not set on the host")!
+      held
+    }
+    some(value.object([("listen", value.string(c.invoke)), ("invoke", value.bool(true)), ("token", value.string(token))]))
+  },
+  _ => none,
+}
+
 // One run on this process, to its end: what `run` does, and what the
 // process behind a background run does.
 local effect fn run_here(line: grants.RunLine, composed: compose.Composition?, mode: String, written: List[String]) -> Int = {
-  let outcome = engine.run(whole_request(line, composed, mode, written, 0)!)!
+  let whole = whole_request(line, composed, mode, written, 0)!
+  let outcome = engine.run(match invoked(composed)! {
+    some(door) => {
+      guard mode == "" else err("[invoke] takes requests from outside, which a record cannot replay: --record is for a run that ends")!
+      value.merge(whole, door)
+    },
+    none => whole,
+  })!
   if outcome.error != "" then {
     eprintln("nautra: ${outcome.error}")
   } else if mode == "replay" then {

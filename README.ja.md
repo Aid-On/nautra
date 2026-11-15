@@ -213,6 +213,29 @@ env = ["MCP_URL=https://mcp.example.com/mcp", "MCP_TOOL=search"]
 secrets = ["MCP_TOKEN@mcp.example.com"]
 ```
 
+### エージェントを公開する
+
+エージェントは、仕事を終えたら終了するワークロードです。エージェントの実行基盤が求めるのはサーバです。`[agent]` の横に `[invoke]` を書くと、エージェントを書き換えずに公開できます。POST 1 回が実行 1 回になり、リクエストの本文が標準入力に、標準出力がそのまま応答になります。
+
+```toml
+[agent]
+image = "agent.wasm"
+secrets = ["MODEL_KEY@api.example.com"]
+
+[invoke]
+listen = "8080"            # PORT（このマシンのみ）か ADDRESS:PORT
+token = "DOOR_TOKEN"       # 認証する基盤の後ろに置くなら open = true
+```
+
+```console
+$ nautra run -f nautra.toml
+nautra: each POST runs the workload: http://127.0.0.1:8080/invocations
+$ curl -H "Authorization: Bearer $DOOR_TOKEN" -d '{"prompt": "What does the note say?"}' localhost:8080/invocations
+The note says: THE TIDE IS IN
+```
+
+リクエストをまたいで残るものはありません。パスは何でも受け付け、`GET /ping` には `{"status": "Healthy"}` を返します。これは Amazon Bedrock AgentCore Runtime がコンテナに求める形です。コンテナに入れるものは [examples/platforms](examples/platforms/) にあります。詳しくは [ADR-0003](docs/adr/0003-platforms.md) を参照してください。
+
 ### 別の場所で動くエージェントにツールを公開する
 
 これらのツールを使うエージェントは、Wasm である必要も、Nautra の下で動いている必要もありません。`[agent]` の代わりに `[mcp]` を書いた構成ファイルは、ツール群を MCP サーバとして公開します。
