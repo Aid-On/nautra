@@ -233,6 +233,112 @@ def record_checks(n, project, env, asked, token):
     check("a service cannot be recorded", n("run", "--record", project / "x.record", "-p", "8080", "-f", "agent.toml", cwd=project), 125, err="a run that ends")
 
 
+def team_checks(n, wasm, project, env, port, tools):
+    """Delegation, checks, and a remote MCP server reached through a tool image."""
+    model = f'env = ["MODEL_URL=http://127.0.0.1:{port}/v1/chat/completions", "MODEL_NAME=fixture"]\nsecrets = ["MODEL_KEY@127.0.0.1:{port}"]\n'
+    (project / "helper.toml").write_text(f'[agent]\nimage = "{wasm("agent")}"\n{model}' + tools)
+    (project / "lead.toml").write_text(f'[agent]\nimage = "{wasm("agent")}"\n{model}\n[tools.helper]\nagent = "helper.toml"\ndescription = "Hand a task to the helper."\n')
+    check("an agent hands work to another agent", n("run", "-f", project / "lead.toml", "delegate", "this", env=env), 0, out="the helper said: TIDE!")
+    (project / "self.toml").write_text(f'[agent]\nimage = "{wasm("agent")}"\n{model}\n[tools.me]\nagent = "self.toml"\n')
+    check("an agent that names itself is refused", n("run", "-f", project / "self.toml", "task", env=env), 125, err="more than 4 deep")
+
+    # Checks: one set before a tool, one that must accept the finished work.
+    ws = project / "checked"
+    ws.mkdir()
+    (project / "checked.toml").write_text(f"""
+[agent]
+image = "{wasm('toolcall')}"
+audit = "checked.jsonl"
+
+[tools.write_file]
+image = "{wasm('write_file')}"
+description = "Write a file."
+mounts = ["checked:/work"]
+
+[checks.only_notes]
+image = "{wasm('only_notes')}"
+before = ["write_file"]
+
+[checks.has_summary]
+image = "{wasm('has_summary')}"
+finish = true
+mounts = ["checked:/work:ro"]
+""")
+    call = lambda *args: n("run", "-f", project / "checked.toml", *args)
+    check("a workload is offered verify when work must be accepted", call(), 4, out="verify: Run the checks")
+    refused = call("write_file", '{"path": "elsewhere.txt", "text": "x"}')
+    check("a check refuses a tool call, and says why", refused, 4, out="check only_notes refused it")
+    check("the reason reaches the caller", refused, 4, out="under notes/ only")
+    expect("a refused tool did not run", not (ws / "elsewhere.txt").exists())
+    check("work that is not accepted is exit code 4", refused, 4, err="its work is not accepted: check has_summary")
+    check("verify says what is missing while there is time", call("verify"), 4, out="notes/summary.txt is missing")
+    done = call("write_file", '{"path": "notes/summary.txt", "text": "done"}')
+    check("a permitted call runs, and accepted work ends well", done, 0, out="wrote 4 characters")
+    check("verify agrees once the work is there", call("verify"), 0, out="every check passes")
+    reasons = [r.get("reason", "") for r in map(json.loads, (project / "checked.jsonl").read_text().splitlines())]
+    expect("a check's refusal is in the audit", any("refused by check only_notes" in r for r in reasons), repr(reasons))
+    (project / "never.toml").write_text(f'[agent]\nimage = "{wasm("toolcall")}"\n[checks.c]\nimage = "{wasm("only_notes")}"\n')
+    check("a check with no occasion is refused", n("run", "-f", project / "never.toml"), 125, err="would never run")
+
+    # A remote MCP server: a tool image granted the server's host and a secret.
+    remote_token = "mcp-token-s3cr3t"
+    calls = []
+
+    class Remote(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            message = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+            calls.append((self.headers.get("Authorization"), self.headers.get("Mcp-Session-Id"), message.get("method")))
+            if self.headers.get("Authorization") != f"Bearer {remote_token}":
+                self.send_response(401)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if "id" not in message:
+                self.send_response(202)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if message["method"] == "initialize":
+                result, extra = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "fixture", "version": "1"}}, [("Mcp-Session-Id", "session-1")]
+            else:
+                query = message["params"]["arguments"].get("query", "")
+                result, extra = {"content": [{"type": "text", "text": f"found: {query}"}], "isError": False}, []
+            payload = json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result})
+            if self.path == "/stream" and message["method"] == "tools/call":
+                body, kind = f"event: message\ndata: {payload}\n\n".encode(), "text/event-stream"
+            else:
+                body, kind = payload.encode(), "application/json"
+            self.send_response(200)
+            self.send_header("Content-Type", kind)
+            self.send_header("Content-Length", str(len(body)))
+            for name, text in extra:
+                self.send_header(name, text)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Remote)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    remote = server.server_address[1]
+    for path in ("mcp", "stream"):
+        (project / f"remote-{path}.toml").write_text(f"""
+[agent]
+image = "{wasm('toolcall')}"
+
+[tools.search]
+image = "{wasm('mcp_call')}"
+description = "Search."
+env = ["MCP_URL=http://127.0.0.1:{remote}/{path}", "MCP_TOOL=lookup"]
+secrets = ["MCP_TOKEN@127.0.0.1:{remote}"]
+""")
+    renv = {"MCP_TOKEN": remote_token}
+    check("a remote MCP tool is called through a tool image", n("run", "-f", project / "remote-mcp.toml", "search", '{"query": "tide"}', env=renv), 0, out="found: tide", absent=remote_token)
+    check("a streamed MCP reply is read", n("run", "-f", project / "remote-stream.toml", "search", '{"query": "pool"}', env=renv), 0, out="found: pool")
+    expect("the remote server saw the session and the real token", ("Bearer " + remote_token, "session-1", "tools/call") in calls, repr(calls))
+
+
 def compose_checks(n, wasm, work):
     """nautra.toml: a workload and the tools it may call, each an image with its own grants."""
     project = work / "project"
@@ -279,7 +385,12 @@ mounts = ["ws:/work:ro"]
             asked.append((self.headers.get("Authorization"), body))
             results = [m["content"] for m in body["messages"] if m["role"] == "tool"]
             task = body["messages"][0]["content"]
-            if "loop" in task and not any("used up" in r for r in results):
+            call = lambda name, arguments: {"role": "assistant", "tool_calls": [{"id": f"c{len(results)}", "type": "function", "function": {"name": name, "arguments": json.dumps(arguments)}}]}
+            if "delegate" in task:
+                message = call("helper", {"task": "shout tide"}) if not results else {"role": "assistant", "content": f"the helper said: {results[0]}"}
+            elif task.startswith("shout"):
+                message = call("upper", {"text": task.split()[1]}) if not results else {"role": "assistant", "content": f"{results[0]}!"}
+            elif "loop" in task and not any("used up" in r for r in results):
                 message = {"role": "assistant", "tool_calls": [{"id": f"c{len(results)}", "type": "function", "function": {"name": "upper", "arguments": json.dumps({"text": "again"})}}]}
             elif "loop" in task:
                 message = {"role": "assistant", "content": f"stopped after {len(results) - 1} calls"}
@@ -313,6 +424,7 @@ mounts = ["ws:/work:ro"]
     check("the run's tool calls have a ceiling", looped, 0, out="stopped after 3 calls")
     check("an agent needs its key", n("run", "-f", project / "agent.toml", "task"), 125, err="MODEL_KEY is not set")
     record_checks(n, project, env, asked, token)
+    team_checks(n, wasm, project, env, port, tools)
 
     started = n("run", "-d", "--name", "agent-bg", "-f", project / "agent.toml", "What does the note say?", env=env)
     check("a composition runs in the background", started, 0)

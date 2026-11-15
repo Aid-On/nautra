@@ -1,0 +1,17 @@
+// SPDX-License-Identifier: Apache-2.0
+// A tool that writes one file under /work. The entry that declares it has to
+// mount a directory there, writable.
+import fs
+import io
+import json
+import path
+
+effect fn main() -> Unit = {
+  let arguments = json.parse(io.read_all())!
+  let name = value.get_string(arguments, "path") ?? ""
+  let text = value.get_string(arguments, "text") ?? ""
+  let target = path.join("/work", name)
+  fs.mkdir_p(path.dirname(target))!
+  fs.write_text(target, text)!
+  println("wrote ${string.len(text)} characters to ${name}")
+}

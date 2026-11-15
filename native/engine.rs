@@ -49,6 +49,8 @@ pub use upload::nt_http_upload;
 /// run the engine refused or could not start, 137 for a resource ceiling.
 const EXIT_TIMEOUT: i64 = 124;
 const EXIT_REFUSED: i64 = 125;
+/// The guest ended well, and a finish check did not accept its work.
+const EXIT_NOT_ACCEPTED: i64 = 4;
 /// A replayed or resumed run that did not follow its record.
 const EXIT_LEFT_RECORD: i64 = 3;
 const EXIT_TRAPPED: i64 = 134;
@@ -204,7 +206,7 @@ fn run_with(request: &Value, capture: Option<&Capture>) -> Value {
     }
     let deadline = Deadline::arm(&engine, limits.timeout_ms);
     let ended = if component {
-        run_component(&engine, &bytes, ComponentCtx::new(wasi, request, &limits, audit, tools, journal.clone()), &limits)
+        run_component(&engine, &bytes, ComponentCtx::new(wasi, request, &limits, audit, tools.clone(), journal.clone()), &limits)
     } else {
         run_module(&engine, &bytes, wasi, &limits)
     };
@@ -217,6 +219,13 @@ fn run_with(request: &Value, capture: Option<&Capture>) -> Value {
         report["replayed"] = json!(journal.replayed());
         if let Err(reason) = journal.finish(report["exit_code"].as_i64().unwrap_or(EXIT_REFUSED)) {
             return json!({ "exit_code": EXIT_LEFT_RECORD, "error": format!("the run left its record: {reason}") });
+        }
+    }
+    // A guest saying it is done is a claim; the finish checks are what
+    // accept it.
+    if let Some(tools) = tools.filter(|tools| report["exit_code"] == json!(0) && tools.has_finish_checks()) {
+        if let Err(objection) = tools.accept_finish() {
+            return json!({ "exit_code": EXIT_NOT_ACCEPTED, "error": format!("the run ended, but its work is not accepted: {objection}") });
         }
     }
     report

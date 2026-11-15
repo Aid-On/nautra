@@ -32,12 +32,32 @@ struct Tool {
     input: Value,
     check: jsonschema::Validator,
     request: Value,
+    /// The tool is itself an agent: its one argument, `task`, is handed to it
+    /// as a command-line argument instead of JSON on stdin.
+    task: bool,
     /// Calls this tool has left, when it has a ceiling.
     left: Mutex<Option<u64>>,
 }
 
+/// An image the operator requires to agree: before certain tools are called,
+/// or before the run is accepted as finished. It is run fresh, under its own
+/// grants, with what it is asked about as JSON on stdin; exit 0 is agreement
+/// and anything else is a refusal whose output is the reason.
+struct Check {
+    name: String,
+    request: Value,
+    /// The tools it is consulted before; `*` is every tool.
+    before: Vec<String>,
+    finish: bool,
+}
+
+/// The tool a guest may call to run the finish checks itself, and read what
+/// they object to while it can still do something about it.
+const VERIFY: &str = "verify";
+
 pub(super) struct Tools {
     tools: Vec<Tool>,
+    checks: Vec<Check>,
     /// Calls left across every tool, when the run has a ceiling.
     left: Mutex<Option<u64>>,
     audit: Option<Arc<Audit>>,
@@ -56,7 +76,18 @@ impl Tools {
     /// the run before the guest starts.
     pub(super) fn of(request: &Value, audit: Option<Arc<Audit>>, journal: Option<Arc<Journal>>) -> Result<Option<Arc<Tools>>, String> {
         let entries: Vec<&Value> = request["tools"].as_array().into_iter().flatten().collect();
-        if entries.is_empty() {
+        let checks: Vec<Check> = request["checks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|entry| Check {
+                name: entry["name"].as_str().unwrap_or("check").to_owned(),
+                request: entry["request"].clone(),
+                before: entry["before"].as_array().into_iter().flatten().filter_map(|tool| tool.as_str().map(str::to_owned)).collect(),
+                finish: entry["finish"].as_bool().unwrap_or(false),
+            })
+            .collect();
+        if entries.is_empty() && checks.is_empty() {
             return Ok(None);
         }
         let mut tools = Vec::new();
@@ -68,13 +99,14 @@ impl Tools {
                 description: entry["description"].as_str().unwrap_or("").to_owned(),
                 left: Mutex::new(entry["max_calls"].as_u64().filter(|max| *max > 0)),
                 request: entry["request"].clone(),
+                task: entry["task"].as_bool().unwrap_or(false),
                 name,
                 input,
                 check,
             });
         }
         let left = Mutex::new(request["max_tool_calls"].as_u64().filter(|max| *max > 0));
-        Ok(Some(Arc::new(Tools { tools, left, audit, journal })))
+        Ok(Some(Arc::new(Tools { tools, checks, left, audit, journal })))
     }
 
     /// Answers one MCP request.
@@ -94,13 +126,21 @@ impl Tools {
                 "serverInfo": { "name": "nautra", "version": env!("CARGO_PKG_VERSION") },
             })),
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({
-                "tools": self.tools.iter().map(|tool| json!({
+            "tools/list" => {
+                let mut listed: Vec<Value> = self.tools.iter().map(|tool| json!({
                     "name": tool.name,
                     "description": tool.description,
                     "inputSchema": tool.input,
-                })).collect::<Vec<_>>(),
-            })),
+                })).collect();
+                if self.offers_verify() {
+                    listed.push(json!({
+                        "name": VERIFY,
+                        "description": "Run the checks this work must pass to be accepted, and return what they object to. Call it before you give your final answer; if it reports a problem, fix the problem and call it again.",
+                        "inputSchema": { "type": "object", "additionalProperties": false },
+                    }));
+                }
+                Ok(json!({ "tools": listed }))
+            }
             "tools/call" => self.call(&message["params"]).await,
             other => Err((-32601, format!("unknown method '{other}'"))),
         };
@@ -109,6 +149,22 @@ impl Tools {
 
     async fn call(&self, params: &Value) -> Result<Value, (i64, String)> {
         let name = params["name"].as_str().unwrap_or("");
+        if name == VERIFY && self.offers_verify() {
+            let live = async {
+                match self.finish_verdict(|request, stdin| run_tool(request, stdin)).await {
+                    None => json!({ "content": [{ "type": "text", "text": "every check passes" }], "isError": false }),
+                    Some(objection) => failed(objection),
+                }
+            };
+            let result = match &self.journal {
+                Some(journal) => journal.exchange(json!({ "kind": "tool", "name": VERIFY, "arguments": {} }), live).await,
+                None => live.await,
+            };
+            return Ok(match result["fault"].as_str() {
+                Some(fault) => failed(format!("this run has left its record: {fault}")),
+                None => result,
+            });
+        }
         let Some(tool) = self.tools.iter().find(|tool| tool.name == name) else {
             self.record(name, "deny", json!({ "reason": "no such tool" }));
             return Err((-32602, format!("no tool named '{name}'")));
@@ -148,20 +204,76 @@ impl Tools {
         })
     }
 
-    /// Runs the tool's image and turns how it ended into an MCP result.
+    /// Whether the guest is offered `verify`: there is a finish check, and no
+    /// tool of the operator's own has taken the name.
+    fn offers_verify(&self) -> bool {
+        self.checks.iter().any(|check| check.finish) && !self.tools.iter().any(|tool| tool.name == VERIFY)
+    }
+
+    /// Whether any check must pass before the run is accepted.
+    pub(super) fn has_finish_checks(&self) -> bool {
+        self.checks.iter().any(|check| check.finish && !check.request.is_null())
+    }
+
+    /// Runs the finish checks in order and returns the first objection, or
+    /// `None` when every one agrees. `run` is how a check's image is run:
+    /// on a thread of its own from inside the guest's event loop, directly
+    /// once the guest has ended.
+    async fn finish_verdict<F, Fut>(&self, run: F) -> Option<String>
+    where
+        F: Fn(Value, Vec<u8>) -> Fut,
+        Fut: std::future::Future<Output = super::Captured>,
+    {
+        for check in self.checks.iter().filter(|check| check.finish && !check.request.is_null()) {
+            let outcome = run(check.request.clone(), json!({ "event": "finish" }).to_string().into_bytes()).await;
+            let passed = outcome.exit_code == 0;
+            self.record(&check.name, if passed { "allow" } else { "deny" }, json!({ "check": "finish", "exit_code": outcome.exit_code }));
+            if !passed {
+                return Some(format!("check {} does not accept this yet:\n{}", check.name, said(&outcome)));
+            }
+        }
+        None
+    }
+
+    /// The finish checks, run after the guest has ended. `Err` is the first
+    /// objection.
+    pub(super) fn accept_finish(&self) -> Result<(), String> {
+        let verdict = futures_lite(self.finish_verdict(|request, stdin| std::future::ready(super::run_captured(&request, stdin))));
+        match verdict {
+            None => Ok(()),
+            Some(objection) => Err(objection),
+        }
+    }
+
+    /// Runs the tool's image and turns how it ended into an MCP result. The
+    /// checks set before this tool are consulted first; one refusal and the
+    /// tool is not run.
     async fn run(&self, tool: &Tool, arguments: Value) -> Value {
         let name = &tool.name;
-        let outcome = run_tool(tool.request.clone(), arguments.to_string().into_bytes()).await;
+        for check in self.checks.iter().filter(|check| !check.request.is_null() && check.before.iter().any(|before| before == "*" || before == name)) {
+            let asked = json!({ "event": "tool", "tool": name, "arguments": arguments });
+            let outcome = run_tool(check.request.clone(), asked.to_string().into_bytes()).await;
+            if outcome.exit_code != 0 {
+                self.record(name, "deny", json!({ "reason": format!("refused by check {}", check.name) }));
+                return failed(format!("{name} was not run: check {} refused it:\n{}", check.name, said(&outcome)));
+            }
+        }
+        let (request, stdin) = if tool.task {
+            // An agent takes its task as an argument, as it does from a shell.
+            let mut request = tool.request.clone();
+            if let Some(args) = request["args"].as_array_mut() {
+                args.push(json!(arguments["task"].as_str().unwrap_or("")));
+            }
+            (request, Vec::new())
+        } else {
+            (tool.request.clone(), arguments.to_string().into_bytes())
+        };
+        let outcome = run_tool(request, stdin).await;
         self.record(name, "allow", json!({ "exit_code": outcome.exit_code }));
         if outcome.exit_code == 0 {
             json!({ "content": [{ "type": "text", "text": outcome.stdout.trim_end() }], "isError": false })
         } else {
-            let said = [outcome.error.as_str(), outcome.stderr.trim_end(), outcome.stdout.trim_end()]
-                .into_iter()
-                .filter(|text| !text.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n");
-            failed(if said.is_empty() { format!("{name} ended with exit code {}", outcome.exit_code) } else { said })
+            failed(said(&outcome))
         }
     }
 
@@ -171,6 +283,27 @@ impl Tools {
             more["decision"] = json!(decision);
             more["name"] = json!(name);
             audit.record(more);
+        }
+    }
+}
+
+/// What a run that did not succeed had to say for itself.
+fn said(outcome: &super::Captured) -> String {
+    let said = [outcome.error.as_str(), outcome.stderr.trim_end(), outcome.stdout.trim_end()]
+        .into_iter()
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if said.is_empty() { format!("it ended with exit code {}", outcome.exit_code) } else { said }
+}
+
+/// Drives a future that never waits on anything outside itself.
+fn futures_lite<T>(future: impl std::future::Future<Output = T>) -> T {
+    let mut future = std::pin::pin!(future);
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        if let std::task::Poll::Ready(value) = future.as_mut().poll(&mut context) {
+            return value;
         }
     }
 }

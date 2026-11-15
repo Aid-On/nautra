@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+// A finish check: the run is accepted only if it left a summary. It sees the
+// workspace through its own read-only mount, not through the agent.
+import fs
+
+effect fn main() -> Unit = {
+  let summary = fs.read_text_if_exists("/work/notes/summary.txt")! ?? ""
+  guard string.trim(summary) != "" else err("notes/summary.txt is missing or empty; write the summary there")!
+  println("ok")
+}

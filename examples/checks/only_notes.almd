@@ -1,0 +1,14 @@
+// SPDX-License-Identifier: Apache-2.0
+// A check set before a tool: it is told which tool is about to be called and
+// with what, and refuses by ending with an error. This one lets files be
+// written under notes/ and nowhere else.
+import io
+import json
+
+effect fn main() -> Unit = {
+  let asked = json.parse(io.read_all())!
+  let arguments = value.get(asked, "arguments") ?? value.object([])
+  let target = value.get_string(arguments, "path") ?? ""
+  guard string.starts_with(target, "notes/") and not string.contains(target, "..") else err("files may be written under notes/ only, not '${target}'")!
+  println("ok")
+}

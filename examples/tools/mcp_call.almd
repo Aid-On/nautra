@@ -1,0 +1,68 @@
+// SPDX-License-Identifier: Apache-2.0
+// A tool that calls one tool on a remote MCP server (streamable HTTP).
+//
+// This is how a remote MCP server is given to an agent: as an ordinary tool
+// image whose entry grants it the server's host and, if it needs one, a
+// secret bound to that host. Nautra itself knows nothing about the server.
+//
+//   [tools.search]
+//   image = "…/mcp_call.wasm"
+//   env = ["MCP_URL=https://mcp.example.com/mcp", "MCP_TOOL=search"]
+//   secrets = ["MCP_TOKEN@mcp.example.com"]
+import env
+import http
+import io
+import json
+
+// The JSON-RPC message in a reply, whether it came as JSON or as one event
+// of a stream.
+fn message_of(resp: HttpResponse) -> Value! = {
+  let body = http.body(resp)
+  let streamed = string.contains(http.header(resp, "content-type") ?? "", "text/event-stream")
+  let text = if not streamed then body else
+    (string.lines(body) |> list.filter_map((line) => string.strip_prefix(line, "data:")) |> list.map(string.trim) |> list.last) ?? ""
+  json.parse(text) |> result.map_err((e) => "the server's reply is not JSON: ${e}")
+}
+
+effect fn send(target: String, headers: List[(String, String)], message: Value) -> HttpResponse = {
+  let resp = http.send(http.new_request("POST", target, json.stringify(message), headers))!
+  guard http.status(resp) < 300 else err("the server answered ${http.status(resp)}")!
+  resp
+}
+
+fn rpc(id: Int, method: String, params: Value) -> Value = value.object([
+  ("jsonrpc", value.string("2.0")),
+  ("id", value.int(id)),
+  ("method", value.string(method)),
+  ("params", params),
+])
+
+effect fn main() -> Unit = {
+  let target = env.get("MCP_URL") |> option.to_result("MCP_URL is not set")!
+  let tool = env.get("MCP_TOOL") |> option.to_result("MCP_TOOL is not set")!
+  let arguments = json.parse(io.read_all())!
+  let token = match env.get("MCP_TOKEN") {
+    some(t) => [("Authorization", "Bearer ${t}")],
+    none => [],
+  }
+  let base = [("Content-Type", "application/json"), ("Accept", "application/json, text/event-stream")] + token
+  let hello = send(target, base, rpc(1, "initialize", value.object([
+    ("protocolVersion", value.string("2025-06-18")),
+    ("capabilities", value.object([])),
+    ("clientInfo", value.object([("name", value.string("nautra-mcp-call")), ("version", value.string("0.1.0"))])),
+  ])))!
+  let session = match http.header(hello, "mcp-session-id") {
+    some(id) => [("Mcp-Session-Id", id)],
+    none => [],
+  }
+  let _ = send(target, base + session, value.object([("jsonrpc", value.string("2.0")), ("method", value.string("notifications/initialized"))]))!
+  let reply = message_of(send(target, base + session, rpc(2, "tools/call", value.object([("name", value.string(tool)), ("arguments", arguments)])))!)!
+  match value.get(reply, "error") {
+    some(problem) => err(value.get_string(problem, "message") ?? "the server refused the call")!,
+    none => (),
+  }
+  let result = value.get(reply, "result") ?? value.object([])
+  let said = (value.get_array(result, "content") ?? []) |> list.filter_map((part) => value.get_string(part, "text")) |> list.join("\n")
+  guard not (value.get_bool(result, "isError") ?? false) else err(said)!
+  println(said)
+}

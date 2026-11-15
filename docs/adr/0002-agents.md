@@ -1,7 +1,7 @@
 # ADR-0002: Agents
 
-Status: accepted (2026-11-15). Implemented so far: §2 (secrets), §3 (tools),
-§4 for one workload and its tools, and §5 (the audit and the record).
+Status: accepted (2026-11-15). Steps 1 to 4 of the order below are
+implemented; step 5 (`exec`) is not.
 
 Nautra is to be an environment agents run in, and to do everything
 [Porta](https://github.com/almide/porta) does. Porta grew its agent runtime
@@ -76,6 +76,26 @@ describes several services that run together: an entry is an image, its
 grants, and the name others reach it by. Checks that must pass before a tool
 call or before the agent may finish are images too, named in the same file.
 
+**Checks.** A check is run fresh under its own grants, told what it is asked
+about as JSON on stdin (`{"event": "tool", "tool", "arguments"}` or
+`{"event": "finish"}`), and answers by its exit code; its output is the
+reason. A check `before` a tool refuses the call without the tool running. A
+`finish` check runs after the workload ends with exit 0; a refusal makes the
+run's exit code 4. A workload ending is a claim, and the check accepts it or
+does not. The same finish checks are offered to the workload as the tool
+`verify`, so an agent can learn what is missing while it can still act —
+feedback without a protocol of its own.
+
+**Delegation.** A tool entry with `agent = "other.toml"` is that whole
+composition, called with one argument, `task`. It shares nothing with its
+caller. Depth is limited to four, which also stops a file that names itself.
+
+**Remote MCP.** Not an engine feature. A remote server is reached by a tool
+image that speaks MCP to it (`examples/tools/mcp_call.almd`), so the server
+is a granted host with a bound secret like any other destination, its calls
+are in the audit as that tool's requests, and under a record its results are
+tool results.
+
 ## 5. The record
 
 `--audit FILE` appends one JSON object per decision at the boundary: each
@@ -136,7 +156,7 @@ written for them is ported by making it speak MCP over HTTP.
 1. Secrets and the network record. *(done)*
 2. Tools as images, the composition file, and a sample agent in Almide. *(done)*
 3. `--record`, `replay`, resume. *(done, without clock and randomness)*
-4. Checks, delegation, remote MCP.
+4. Checks, delegation, remote MCP. *(done)*
 5. `exec`.
 
 Organisation-wide concerns — collecting records centrally, policy on which

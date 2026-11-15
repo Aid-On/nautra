@@ -170,6 +170,49 @@ TIDE
 
 [`examples/agent`](examples/agent) に、Almide で書いた100行ほどのエージェントと、ツール2つがあります。
 
+### 検査
+
+検査は、運用する側が「同意すること」を求めるイメージです。呼ばれるたびに新しく起動し、独自の権限で動きます。何について聞かれているかは、標準入力から JSON で受け取ります。終了コード 0 が同意で、それ以外は拒否です。拒否のときは、出力した内容が理由になります。
+
+```toml
+[checks.only_notes]
+image = "checks/only-notes:v1"
+before = ["write_file"]                  # これらのツールの前に聞く。"*" は全ツール
+
+[checks.has_summary]
+image = "checks/has-summary:v1"
+finish = true                            # これが認めるまで、実行は受理されない
+mounts = ["./workspace:/work:ro"]        # エージェント経由ではなく、自分の目で確かめる
+```
+
+`before` を指定した検査には、ツールの名前と引数が渡ります。検査が拒否すると、ツールは実行されません。呼び出した側には、理由がエラーの結果として返ります。
+
+`finish` を指定した検査は、ワークロードが終了コード 0 で終わったときに走ります。検査が拒否すると、実行は終了コード 4 で終わり、理由を表示します。ワークロードの「終わりました」は申告にすぎず、受理するのは検査です。エージェントが手を打てるうちに結果を知れるよう、同じ検査を `verify` というツールとしても渡します。`verify` は、検査が何に不満かを返します。
+
+### エージェントをツールにする
+
+ツールには、別のエージェントも指定できます。モデルもツールも独自に持つ、構成ファイル1つ分です。引数は `task` の1つだけです。
+
+```toml
+[tools.reviewer]
+agent = "reviewer.toml"
+description = "Review a proposed change independently."
+```
+
+呼ばれる側のエージェントには、呼んだ側のものは何も渡りません。会話も、秘密の値も、マウントも、ツールも渡りません。仕事を次へ渡せる深さは4段までです。
+
+### 外部の MCP サーバ
+
+外部の MCP サーバは、「そのサーバを呼ぶツールイメージ」としてエージェントに渡します。[`examples/tools/mcp_call.almd`](examples/tools/mcp_call.almd) が60行ほどの実例です。こうすると、サーバはほかの宛先と同じく「許可したホストと、束縛した秘密の値」で表せます。Nautra 自身は、そのサーバについて何も知る必要がありません。
+
+```toml
+[tools.search]
+image = "ghcr.io/you/mcp-call:v1"
+description = "Search the knowledge base."
+env = ["MCP_URL=https://mcp.example.com/mcp", "MCP_TOOL=search"]
+secrets = ["MCP_TOKEN@mcp.example.com"]
+```
+
 ### 記録、再生、再開
 
 `--record FILE` を付けると、実行の境界を越えたやり取りを順番どおりに書き残します。外向きの HTTP リクエストとその応答、ツールの呼び出しとその結果が対象です。
@@ -290,7 +333,7 @@ OCI Distribution API に対応したレジストリなら、どれでも使え�
 
 **プレアルファです。** ここまでに書いた機能は動作し、macOS と CI 上の Linux で `scripts/integration.py` が検証しています。WASI 0.3 とその `wasi:http` は wasmtime でまだ実験的な扱いで、サービスの機能もその制約を受けます。push と pull はローカルの `registry:2` で検証済みですが、公開レジストリではまだ検証していません。
 
-エージェント向けの機能は、[ADR-0002](docs/adr/0002-agents.md) に書いた順番で作っています。秘密の値の束縛、判定の記録、ツール、実行の記録・再生・再開は入りました。ツール呼び出し前と完了前の検査、ほかのエージェントへの委任、外部の MCP サーバ、ネイティブコマンドの閉じ込めは、まだありません。
+エージェント向けの機能は、[ADR-0002](docs/adr/0002-agents.md) に書いた順番で作っています。残っているのは最後の1つ、ホストのカーネルでネイティブコマンドを閉じ込める機能（`nautra exec`）だけです。これは今も Porta の役目です。
 
 まだ無いもの：
 

@@ -213,6 +213,61 @@ recorded beside the network decisions, the tools' own included.
 [`examples/agent`](examples/agent) is a complete agent in Almide, about a
 hundred lines, with two tools.
 
+### Checks
+
+A check is an image the operator requires to agree. It is run fresh, under
+its own grants, and is told what it is being asked about as JSON on stdin;
+exit 0 is agreement, anything else is a refusal whose output is the reason.
+
+```toml
+[checks.only_notes]
+image = "checks/only-notes:v1"
+before = ["write_file"]                  # consulted before these tools; "*" is every tool
+
+[checks.has_summary]
+image = "checks/has-summary:v1"
+finish = true                            # must accept the work before the run is accepted
+mounts = ["./workspace:/work:ro"]        # it looks for itself, not through the agent
+```
+
+A check set `before` a tool sees the tool's name and arguments. If it refuses,
+the tool is not run and the caller gets the reason as an error result.
+
+A `finish` check runs when the workload ends with exit code 0. If it refuses,
+the run ends with exit code 4 and the reason: a workload saying it is done is
+a claim, and the check is what accepts it. So that an agent can find out
+while it can still act, the same checks are offered to it as a tool, `verify`,
+which returns what they object to.
+
+### Agents as tools
+
+A tool can be another agent — a whole composition file, with a model and
+tools of its own. It takes one argument, `task`.
+
+```toml
+[tools.reviewer]
+agent = "reviewer.toml"
+description = "Review a proposed change independently."
+```
+
+The agent behind it gets nothing of the caller's: not its conversation, its
+secrets, its mounts or its tools. Handing work on is limited to four deep.
+
+### Remote MCP servers
+
+A remote MCP server is given to an agent as a tool image that calls it —
+[`examples/tools/mcp_call.almd`](examples/tools/mcp_call.almd) is one, in
+sixty lines — so the server is a granted host and a bound secret like any
+other, and nautra itself knows nothing about it.
+
+```toml
+[tools.search]
+image = "ghcr.io/you/mcp-call:v1"
+description = "Search the knowledge base."
+env = ["MCP_URL=https://mcp.example.com/mcp", "MCP_TOOL=search"]
+secrets = ["MCP_TOKEN@mcp.example.com"]
+```
+
 ### Record, replay, resume
 
 `--record FILE` writes down every exchange at a run's boundary, in order:
@@ -371,9 +426,8 @@ experimental in wasmtime, and services inherit that. Push and pull are tested ag
 `registry:2`, and have not yet been verified against public registries.
 
 Agents are being built in the order [ADR-0002](docs/adr/0002-agents.md)
-gives. Secrets, the audit of decisions, tools, and record / replay / resume
-are in; checks before a tool call and before finishing, delegation to other
-agents, remote MCP servers, and confining native commands are not.
+gives. Everything in it is in except the last step: confining native commands
+with the host kernel (`nautra exec`), which is still Porta's job.
 
 Not there yet:
 

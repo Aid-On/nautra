@@ -11,14 +11,27 @@ import path
 import self.engine
 import self.grants
 
-// A tool: an image started fresh for each call, with its own options.
+// A tool: an image started fresh for each call, with its own options. When
+// `agent` names another composition file, the tool is that whole
+// composition — an agent with tools of its own — given one argument, `task`.
 type Tool = {
   name: String,
   image: String,
+  agent: String,
   options: List[String],
   description: String,
   input: Value,
   max_calls: Int,
+}
+
+// An image that must agree: before the tools named in `before` are called
+// (`*` is every tool), or, with `finish`, before the run is accepted.
+type Check = {
+  name: String,
+  image: String,
+  options: List[String],
+  before: List[String],
+  finish: Bool,
 }
 
 type Composition = {
@@ -26,6 +39,7 @@ type Composition = {
   options: List[String],
   args: List[String],
   tools: List[Tool],
+  checks: List[Check],
   max_tool_calls: Int,
 }
 
@@ -89,40 +103,75 @@ local fn grant_options(table: Value, base: String, where: String) -> List[String
 local fn is_tool_name(name: String) -> Bool =
   name != "" and string.len(name) <= 64 and string.to_list(name) |> list.all((c) => (string.is_alphanumeric(c) and string.byte_len(c) == 1) or c == "_" or c == "-")
 
+local let TASK_INPUT = value.object([
+  ("type", value.string("object")),
+  ("properties", value.object([("task", value.object([("type", value.string("string")), ("description", value.string("What to do, in full: the agent is told nothing else."))]))])),
+  ("required", value.array([value.string("task")])),
+  ("additionalProperties", value.bool(false)),
+])
+
 local fn tool(name: String, table: Value, base: String) -> Tool! = {
   let where = "[tools.${name}]"
   guard is_tool_name(name) else err("'${name}' is not a tool name: use letters, digits, '_' and '-'")
-  only_keys(table, ["image", "description", "input", "max_calls"] + GRANT_KEYS, where)!
-  let image = text(table, "image", where)! |> option.to_result("${where} needs an image")!
-  let input = value.get(table, "input") ?? value.object([("type", value.string("object"))])
-  guard result.is_ok(value.as_object(input)) else err("${where} input must be a JSON Schema object")
-  Tool {
-    name: name,
-    image: image_at(base, image),
-    options: grant_options(table, base, where)!,
-    description: text(table, "description", where)! ?? "",
-    input: input,
-    max_calls: count(table, "max_calls", where)!,
+  only_keys(table, ["image", "agent", "description", "input", "max_calls"] + GRANT_KEYS, where)!
+  let image = text(table, "image", where)!
+  let agent = text(table, "agent", where)!
+  let description = text(table, "description", where)! ?? ""
+  let max_calls = count(table, "max_calls", where)!
+  match (image, agent) {
+    (some(i), none) => {
+      let input = value.get(table, "input") ?? value.object([("type", value.string("object"))])
+      guard result.is_ok(value.as_object(input)) else err("${where} input must be a JSON Schema object")
+      Tool { name: name, image: image_at(base, i), agent: "", options: grant_options(table, base, where)!, description: description, input: input, max_calls: max_calls }
+    },
+    (none, some(file)) => {
+      // An agent's grants and input are its own file's business.
+      only_keys(table, ["agent", "description", "max_calls"], "${where}, which names an agent,")!
+      Tool { name: name, image: "", agent: beside(base, file), options: [], description: description, input: TASK_INPUT, max_calls: max_calls }
+    },
+    _ => err("${where} needs either an image or an agent"),
   }
+}
+
+local fn check(name: String, table: Value, base: String) -> Check! = {
+  let where = "[checks.${name}]"
+  only_keys(table, ["image", "before", "finish"] + GRANT_KEYS, where)!
+  let image = text(table, "image", where)! |> option.to_result("${where} needs an image")!
+  let before = strings(table, "before", where)!
+  let finish = match value.get(table, "finish") {
+    some(v) => value.as_bool(v) |> result.map_err((_) => "${where} finish must be true or false")!,
+    none => false,
+  }
+  guard finish or not list.is_empty(before) else err("${where} says neither `before = [tools]` nor `finish = true`, so it would never run")
+  Check { name: name, image: image_at(base, image), options: grant_options(table, base, where)!, before: before, finish: finish }
+}
+
+local fn entries(doc: Value, key: String) -> List[(String, Value)]! = match value.get(doc, key) {
+  some(table) => value.as_object(table) |> result.map_err((_) => "[${key}] must be a table")!,
+  none => [],
 }
 
 // Reads a parsed composition file. `base` is the directory the file is in.
 fn parse(doc: Value, base: String) -> Composition! = {
-  only_keys(doc, ["agent", "tools"], "nautra.toml")!
+  only_keys(doc, ["agent", "tools", "checks"], "nautra.toml")!
   let agent = value.get(doc, "agent") |> option.to_result("nautra.toml needs an [agent] table")!
   only_keys(agent, ["image", "args", "publish", "audit", "max_tool_calls"] + GRANT_KEYS, "[agent]")!
   let image = text(agent, "image", "[agent]")! |> option.to_result("[agent] needs an image")!
   let publish = option.to_list(text(agent, "publish", "[agent]")!) |> list.flat_map((p) => ["-p", p])
   let audit = option.to_list(text(agent, "audit", "[agent]")!) |> list.flat_map((a) => ["--audit", beside(base, a)])
-  let entries = match value.get(doc, "tools") {
-    some(table) => value.as_object(table) |> result.map_err((_) => "[tools] must be a table of tools")!,
-    none => [],
+  let tools = entries(doc, "tools")! |> list.map(((name, table)) => tool(name, table, base)!)!
+  let checks = entries(doc, "checks")! |> list.map(((name, table)) => check(name, table, base)!)!
+  for c in checks {
+    for named in c.before {
+      guard named == "*" or list.any(tools, (t) => t.name == named) else err("[checks.${c.name}] is set before '${named}', which is not one of the tools")
+    }
   }
   Composition {
     image: image_at(base, image),
     options: grant_options(agent, base, "[agent]")! + publish + audit,
     args: strings(agent, "args", "[agent]")!,
-    tools: entries |> list.map(((name, table)) => tool(name, table, base)!)!,
+    tools: tools,
+    checks: checks,
     max_tool_calls: count(agent, "max_tool_calls", "[agent]")!,
   }
 }
@@ -216,4 +265,36 @@ test "-f is taken out of a run line" {
   assert_eq(split_file(["-f", "nautra.toml", "-d", "--name", "a", "hello", "-f"]), ("nautra.toml", ["-d", "--name", "a"], ["hello", "-f"]))
   assert_eq(split_file(["--file=x.toml"]), ("x.toml", [], []))
   assert_eq(split_file(["-v", "a:/a", "app", "x"]), ("", ["-v", "a:/a"], ["app", "x"]))
+}
+
+test "a tool may be another agent, and a check says when it runs" {
+  let doc = value.object([
+    ("agent", value.object([("image", value.string("a.wasm"))])),
+    ("tools", value.object([
+      ("reviewer", value.object([("agent", value.string("reviewer.toml")), ("description", value.string("Reviews."))])),
+      ("write", value.object([("image", value.string("w.wasm"))])),
+    ])),
+    ("checks", value.object([
+      ("guard", value.object([("image", value.string("g.wasm")), ("before", value.array([value.string("write")]))])),
+      ("tests", value.object([("image", value.string("t.wasm")), ("finish", value.bool(true)), ("mounts", value.array([value.string("ws:/work:ro")]))])),
+    ])),
+  ])
+  let c = parse(doc, "/p")!
+  let reviewer = list.find(c.tools, (t) => t.name == "reviewer") ?? panic("no reviewer")
+  assert_eq(reviewer.agent, "/p/reviewer.toml")
+  assert_eq(reviewer.image, "")
+  assert_eq(value.get_array(reviewer.input, "required"), some([value.string("task")]))
+  let tests = list.find(c.checks, (k) => k.name == "tests") ?? panic("no tests")
+  assert(tests.finish)
+  assert_eq(tests.options, ["-v", "/p/ws:/work:ro"])
+  assert_eq((list.find(c.checks, (k) => k.name == "guard") ?? panic("no guard")).before, ["write"])
+}
+
+test "a tool is an image or an agent, and a check has an occasion" {
+  let with = (tools: Value, checks: Value) => parse(value.object([("agent", value.object([("image", value.string("a.wasm"))])), ("tools", tools), ("checks", checks)]), ".")
+  let none_yet = value.object([])
+  assert(result.is_err(with(value.object([("t", value.object([("image", value.string("i")), ("agent", value.string("f"))]))]), none_yet)))
+  assert(result.is_err(with(value.object([("t", value.object([("agent", value.string("f")), ("mounts", value.array([]))]))]), none_yet)))
+  assert(result.is_err(with(none_yet, value.object([("c", value.object([("image", value.string("i"))]))]))))
+  assert(result.is_err(with(none_yet, value.object([("c", value.object([("image", value.string("i")), ("before", value.array([value.string("absent")]))]))]))))
 }

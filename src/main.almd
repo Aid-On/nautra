@@ -160,40 +160,83 @@ local effect fn prepare(line: grants.RunLine, mode: String, written: List[String
   }
 }
 
+// How deep agents may hand work to agents. A file that names itself, or two
+// that name each other, runs into this.
+let MAX_DEPTH = 4
+
+// An entry's own options as a run line, its decisions recorded in `audit`
+// with those of the workload it belongs to.
+local fn entry_line(options: List[String], image_text: String, audit: String, what: String) -> grants.RunLine! = {
+  let parsed = grants.parse_run(options + [image_text]) |> result.map_err((e) => "${what}: ${e}")!
+  { ...parsed, grants: { ...parsed.grants, audit: audit } }
+}
+
 // One tool as the engine needs it: its name and schema for the workload to
-// see, and the whole request its image runs under each time it is called.
-// A tool's options are judged by the same parser as a `run` line's.
-local effect fn tool_entry(t: compose.Tool, audit: String, live: Bool) -> Value = {
-  let parsed = grants.parse_run(t.options + [t.image]) |> result.map_err((e) => "tool ${t.name}: ${e}")!
-  // What a tool does at its own boundary goes in the same audit as the
-  // workload that called it.
-  let line = { ...parsed, grants: { ...parsed.grants, audit: audit } }
-  // A replay is given each tool's recorded result, so no tool is prepared.
-  let request = if live then prepare(line, "", []) |> result.map_err((e) => "tool ${t.name}: ${e}")! else value.null()
+// see, and the whole request it runs under each time it is called — decided
+// now, before anything starts. A tool that is an agent brings its own tools.
+// When `live` is false the run is a replay, which is given each tool's
+// recorded result, so nothing is prepared.
+local effect fn tool_entry(t: compose.Tool, audit: String, live: Bool, depth: Int) -> Value = {
+  let what = "tool ${t.name}"
+  let request = if not live then value.null() else if t.agent == "" then {
+    prepare(entry_line(t.options, t.image, audit, what)!, "", []) |> result.map_err((e) => "${what}: ${e}")!
+  } else {
+    guard depth < MAX_DEPTH else err("${what}: agents hand work on more than ${MAX_DEPTH} deep; ${t.agent} may be naming itself")!
+    let (expanded, inner) = compose.expand(["-f", t.agent]) |> result.map_err((e) => "${what}: ${e}")!
+    let parsed = grants.parse_run(expanded) |> result.map_err((e) => "${what}: ${e}")!
+    let line = { ...parsed, grants: { ...parsed.grants, audit: audit } }
+    whole_request(line, inner, "", [], depth + 1) |> result.map_err((e) => "${what}: ${e}")!
+  }
   value.object([
     ("name", value.string(t.name)),
     ("description", value.string(t.description)),
     ("input", t.input),
     ("max_calls", value.int(t.max_calls)),
+    ("task", value.bool(t.agent != "")),
     ("request", request),
   ])
+}
+
+local effect fn check_entry(c: compose.Check, audit: String, live: Bool) -> Value = {
+  let what = "check ${c.name}"
+  let request = if live then prepare(entry_line(c.options, c.image, audit, what)!, "", []) |> result.map_err((e) => "${what}: ${e}")! else value.null()
+  value.object([
+    ("name", value.string(c.name)),
+    ("before", value.array(c.before |> list.map(value.string))),
+    ("finish", value.bool(c.finish)),
+    ("request", request),
+  ])
+}
+
+// The request of a workload together with everything its composition gives
+// it: its tools and its checks, each with a request of its own.
+local effect fn whole_request(line: grants.RunLine, composed: compose.Composition?, mode: String, written: List[String], depth: Int) -> Value = {
+  let base = prepare(line, mode, written)!
+  match composed {
+    none => base,
+    some(c) => {
+      let live = mode != "replay"
+      var tools: List[Value] = []
+      for t in c.tools {
+        tools = tools + [tool_entry(t, line.grants.audit, live, depth)!]
+      }
+      var checks: List[Value] = []
+      for k in c.checks {
+        checks = checks + [check_entry(k, line.grants.audit, live)!]
+      }
+      value.merge(base, value.object([
+        ("tools", value.array(tools)),
+        ("checks", value.array(checks)),
+        ("max_tool_calls", value.int(c.max_tool_calls)),
+      ]))
+    },
+  }
 }
 
 // One run on this process, to its end: what `run` does, and what the
 // process behind a background run does.
 local effect fn run_here(line: grants.RunLine, composed: compose.Composition?, mode: String, written: List[String]) -> Int = {
-  let base = prepare(line, mode, written)!
-  let request = match composed {
-    some(c) => {
-      var tools: List[Value] = []
-      for t in c.tools {
-        tools = tools + [tool_entry(t, line.grants.audit, mode != "replay")!]
-      }
-      value.merge(base, value.object([("tools", value.array(tools)), ("max_tool_calls", value.int(c.max_tool_calls))]))
-    },
-    none => base,
-  }
-  let outcome = engine.run(request)!
+  let outcome = engine.run(whole_request(line, composed, mode, written, 0)!)!
   if outcome.error != "" then {
     eprintln("nautra: ${outcome.error}")
   } else if mode == "replay" then {
