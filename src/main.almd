@@ -172,13 +172,10 @@ local fn entry_line(options: List[String], image_text: String, audit: String, wh
   { ...parsed, grants: { ...parsed.grants, audit: audit } }
 }
 
-// The request of a native command: Porta, and the arguments that were
-// worked out for it from the entry's grants.
-local effect fn native_request(args: List[String]) -> Value =
-  value.object([("native", value.object([
-    ("program", value.string(native.porta()!)),
-    ("args", value.array(args |> list.map(value.string))),
-  ]))])
+// The request of a native command: the arguments nautra is started with to
+// run it confined, worked out from the entry's grants when the file was read.
+local fn native_request(args: List[String]) -> Value =
+  value.object([("native", value.object([("args", value.array(args |> list.map(value.string)))]))])
 
 // One tool as the engine needs it: its name and schema for the workload to
 // see, and the whole request it runs under each time it is called — decided
@@ -188,7 +185,7 @@ local effect fn native_request(args: List[String]) -> Value =
 local effect fn tool_entry(t: compose.Tool, audit: String, live: Bool, depth: Int) -> Value = {
   let what = "tool ${t.name}"
   let request = if not live then value.null() else if not list.is_empty(t.native) then {
-    native_request(t.native) |> result.map_err((e) => "${what}: ${e}")!
+    native_request(t.native)
   } else if t.agent == "" then {
     prepare(entry_line(t.options, t.image, audit, what)!, "", []) |> result.map_err((e) => "${what}: ${e}")!
   } else {
@@ -211,7 +208,7 @@ local effect fn tool_entry(t: compose.Tool, audit: String, live: Bool, depth: In
 local effect fn check_entry(c: compose.Check, audit: String, live: Bool) -> Value = {
   let what = "check ${c.name}"
   let request = if not live then value.null()
-    else if not list.is_empty(c.native) then native_request(c.native) |> result.map_err((e) => "${what}: ${e}")!
+    else if not list.is_empty(c.native) then native_request(c.native)
     else prepare(entry_line(c.options, c.image, audit, what)!, "", []) |> result.map_err((e) => "${what}: ${e}")!
   value.object([
     ("name", value.string(c.name)),
@@ -641,6 +638,9 @@ local effect fn dispatch(args: List[String]) -> Int = {
     "rm" => cmd_rm(rest)!,
     "pull" => cmd_pull(rest)!,
     "push" => cmd_push(rest)!,
+    // Not a command for a person: nautra starts itself with this to run one
+    // native tool or check confined (see native.almd).
+    "__native" => native.run(list.get(rest, 0) ?? "")!,
     "version" | "--version" | "-V" => {
       println("nautra ${help.VERSION}")
       0

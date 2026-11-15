@@ -17,7 +17,7 @@ import self.native
 // composition — an agent with tools of its own — given one argument, `task`.
 //
 // When `native` is not empty the tool is a native command, and these are the
-// arguments Porta is run with to confine it (see native.almd).
+// arguments nautra is started with to run it confined (see native.almd).
 type Tool = {
   name: String,
   image: String,
@@ -111,19 +111,19 @@ local fn is_tool_name(name: String) -> Bool =
 
 local let NATIVE_KEYS = ["command", "mounts", "net", "env", "secrets", "timeout", "reads", "porta"]
 
-// The Porta arguments of an entry that names a native command.
+// What nautra is started with to run an entry that names a native command.
 local fn native_args(table: Value, base: String, where: String) -> List[String]! =
-  native.porta_args(
-    strings(table, "command", where)!,
-    base,
-    strings(table, "mounts", where)!,
-    strings(table, "net", where)!,
-    strings(table, "env", where)!,
-    strings(table, "secrets", where)!,
-    text(table, "timeout", where)!,
-    text(table, "reads", where)! ?? "strict",
-    strings(table, "porta", where)!,
-  ) |> result.map_err((e) => "${where} ${e}")
+  native.arguments(native.Entry {
+    command: strings(table, "command", where)!,
+    base: base,
+    mounts: strings(table, "mounts", where)!,
+    net: strings(table, "net", where)!,
+    env: strings(table, "env", where)!,
+    secrets: strings(table, "secrets", where)!,
+    timeout: text(table, "timeout", where)! ?? "",
+    reads: text(table, "reads", where)! ?? "strict",
+    extra: strings(table, "porta", where)!,
+  }) |> result.map_err((e) => "${where} ${e}")
 
 local let TASK_INPUT = value.object([
   ("type", value.string("object")),
@@ -338,7 +338,7 @@ test "a tool is an image or an agent, and a check has an occasion" {
   assert(result.is_err(with(none_yet, value.object([("c", value.object([("image", value.string("i")), ("before", value.array([value.string("absent")]))]))]))))
 }
 
-test "a tool or a check may be a native command, confined by Porta" {
+test "a tool or a check may be a native command" {
   let doc = value.object([
     ("agent", value.object([("image", value.string("a.wasm"))])),
     ("tools", value.object([
@@ -349,8 +349,14 @@ test "a tool or a check may be a native command, confined by Porta" {
     ])),
   ])
   let c = parse(doc, "/p")!
-  assert_eq((list.first(c.tools) ?? panic("no tool")).native, ["run", "git", "-v", "/p/repo:ro", "--no-net", "--read-policy", "strict", "--", "log"])
-  assert_eq((list.first(c.checks) ?? panic("no check")).native, ["run", "make", "--no-net", "--read-policy", "open", "--", "test"])
+  let log = native.decode(list.get((list.first(c.tools) ?? panic("no tool")).native, 1) ?? "")!
+  assert_eq(log.command, ["git", "log"])
+  assert_eq(log.mounts, ["repo:ro"])
+  assert_eq(log.base, "/p")
+  assert_eq(log.reads, "strict")
+  let tests = native.decode(list.get((list.first(c.checks) ?? panic("no check")).native, 1) ?? "")!
+  assert_eq(tests.command, ["make", "test"])
+  assert_eq(tests.reads, "open")
   let both = value.object([("agent", value.object([("image", value.string("a.wasm"))])), ("tools", value.object([("t", value.object([("image", value.string("i")), ("command", value.array([value.string("x")]))]))]))])
   assert(result.is_err(parse(both, ".")))
   let fuel = value.object([("agent", value.object([("image", value.string("a.wasm"))])), ("tools", value.object([("t", value.object([("command", value.array([value.string("x")])), ("fuel", value.int(5))]))]))])

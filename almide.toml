@@ -13,6 +13,15 @@ allow = ["FS.read", "FS.write", "IO", "Env", "Time", "Net", "Proc", "Rand", "Fan
 # a background run from another process that later got its pid), and signal
 # a background run to stop it.
 proc = ["ps", "kill"]
+# Porta's native sandbox, built in: what confines a tool or a check that is a
+# native command. Its native code is the kernel-facing half of nautra's
+# sister project.
+native = ["porta_sandbox"]
+
+[dependencies]
+# Porta's develop branch, pinned to a commit by almide.lock; a tag once Porta
+# releases with the package.
+porta_sandbox = { git = "https://github.com/almide/porta", branch = "develop", subdir = "sandbox" }
 
 # The only native code is the engine: wasmtime, the two parsers it needs (the
 # wasm binary format for `inspect`, TOML for the Nautrafile), and JSON Schema

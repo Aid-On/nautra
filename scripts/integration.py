@@ -341,12 +341,27 @@ secrets = ["MCP_TOKEN@127.0.0.1:{remote}"]
 
 
 def native_checks(n, wasm, project):
-    """Native commands as tools and checks, confined by Porta. Skipped where Porta is not installed."""
-    porta = shutil.which("porta")
-    path = os.environ["PATH"]
-    repo = project / "repo"
+    """Native commands as tools and checks, confined by the sandbox nautra is built with."""
+    # Not under /tmp, where the suite's own files are on Linux: /tmp is the
+    # scratch space every native command may write, so nothing is held there.
+    held = pathlib.Path(tempfile.mkdtemp(prefix="native-it-", dir=pathlib.Path(sys.argv[1]).resolve().parent))
+    repo = held / "repo"
     repo.mkdir()
     (repo / "note.txt").write_text("the tide is in\n")
+    outside = held / "outside-native.txt"
+
+    class Hello(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"reached the listener")
+
+        def log_message(self, *args):
+            pass
+
+    listener = http.server.HTTPServer(("127.0.0.1", 0), Hello)
+    port = listener.server_address[1]
+    threading.Thread(target=listener.serve_forever, daemon=True).start()
     (project / "native.toml").write_text(f"""
 [agent]
 image = "{wasm('toolcall')}"
@@ -357,33 +372,71 @@ description = "Count the words given."
 
 [tools.show]
 command = ["/bin/cat", "note.txt"]
-mounts = ["repo:ro"]
+mounts = ["{repo}:ro"]
 
 [tools.scribble]
 command = ["/bin/sh", "-c", "echo x > new.txt"]
-mounts = ["repo:ro"]
+mounts = ["{repo}:ro"]
+
+[tools.keep]
+command = ["/bin/sh", "-c", "echo kept > kept.txt && cat kept.txt"]
+mounts = ["{repo}"]
+
+[tools.escape]
+command = ["/bin/sh", "-c", "echo x > {outside}"]
+mounts = ["{repo}"]
+
+[tools.dial]
+command = ["/usr/bin/curl", "-sS", "-m", "5", "http://127.0.0.1:{port}/"]
+
+[tools.dial_granted]
+command = ["/usr/bin/curl", "-sS", "-m", "5", "http://127.0.0.1:{port}/"]
+net = ["*:{port}"]
+reads = "open"
+
+[tools.slow]
+command = ["/bin/sleep", "30"]
+timeout = "1s"
+
+[tools.named]
+command = ["/usr/bin/env"]
+env = ["GREETING=hello", "NAUTRA_PASSED"]
 
 [checks.note_is_there]
 command = ["/bin/test", "-s", "note.txt"]
 finish = true
-mounts = ["repo:ro"]
+mounts = ["{repo}:ro"]
 """)
     call = lambda *args, **more: n("run", "-f", project / "native.toml", *args, **more)
-    check("without Porta a native command is refused, and says why", call("show", env={"PATH": "/usr/bin:/bin"}), 125, err="porta is not installed")
     (project / "guest.toml").write_text(f'[agent]\nimage = "{wasm("toolcall")}"\n[tools.t]\ncommand = ["/bin/cat"]\nmounts = ["repo:/work"]\n')
     check("a native command has no guest paths", n("run", "-f", project / "guest.toml"), 125, err="sees host directories where they are")
     (project / "addr.toml").write_text(f'[agent]\nimage = "{wasm("toolcall")}"\n[tools.t]\ncommand = ["/bin/cat"]\nnet = ["10.0.0.1:443"]\n')
-    check("what Porta cannot enforce is refused, not loosened", n("run", "-f", project / "addr.toml"), 125, err="not to an address")
-    if not porta:
-        print("skip  native commands through Porta (porta is not installed)")
-        return
-    env = {"PATH": path}
+    check("what the sandbox cannot enforce is refused, not loosened", n("run", "-f", project / "addr.toml"), 125, err="not to an address")
+    (project / "scratch.toml").write_text(f'[agent]\nimage = "{wasm("toolcall")}"\n[tools.t]\ncommand = ["/bin/cat"]\nmounts = ["/tmp/held:ro"]\n')
+    check("a read-only mount in /tmp, which every native command may write, is refused", n("run", "-f", project / "scratch.toml"), 125, err="cannot be mounted read-only")
+    (project / "word.toml").write_text(f'[agent]\nimage = "{wasm("toolcall")}"\n[tools.t]\ncommand = ["/bin/cat"]\nporta = ["-v", "/"]\n')
+    check("a sandbox word that would open something is not taken", n("run", "-f", project / "word.toml"), 125, err="not a word nautra passes")
+    # No porta on PATH: the sandbox is nautra's own.
+    env = {"PATH": "/usr/bin:/bin"}
     check("a native tool gets its arguments on stdin", call("count_words", '{"text": "one two"}', env=env), 0, out="2")
     check("a native tool reads its mount", call("show", env=env), 0, out="the tide is in")
     check("a native tool cannot write a read-only mount", call("scribble", env=env), 0, out="tool error")
     expect("nothing was written", not (repo / "new.txt").exists())
+    check("a native tool writes its own mount", call("keep", env=env), 0, out="kept")
+    check("a native tool cannot write outside its mount", call("escape", env=env), 0, out="tool error")
+    expect("nothing was written outside", not outside.exists())
+    check("a native tool has no network unless granted", call("dial", env=env), 0, out="tool error", absent="reached the listener")
+    check("a native tool reaches the port its entry grants", call("dial_granted", env=env), 0, out="reached the listener")
+    started = time.time()
+    check("a native tool is stopped at its timeout", call("slow", env=env), 0, out="tool error")
+    expect("the timeout came before the command would have ended", time.time() - started < 20)
+    seen = call("named", env={**env, "NAUTRA_PASSED": "by-name", "NAUTRA_UNNAMED": "stays-out"})
+    check("a native tool sees the variables its entry names, and no others", seen, 0, out="GREETING=hello", absent="stays-out")
+    expect("a variable named without a value is copied from the host", "NAUTRA_PASSED=by-name" in seen[1], seen[1])
+    listener.shutdown()
     (repo / "note.txt").write_text("")
     check("a native finish check refuses", call("show", env=env), 4, err="check note_is_there does not accept")
+    shutil.rmtree(held, ignore_errors=True)
 
 
 def compose_checks(n, wasm, work):

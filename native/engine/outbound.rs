@@ -275,9 +275,24 @@ async fn send_recorded(journal: Arc<Journal>, request: http::Request<WasiBody>, 
         match send_live(request, options, verdict, record, audit).await {
             Err(Error::HttpRequestDenied) => json!({ "denied": true }),
             Err(error) => json!({ "error": error.to_string() }),
-            Ok((response, _io)) => {
+            Ok((response, io)) => {
                 let (parts, body) = response.into_parts();
-                match body.collect().await {
+                // The connection is driven by `io`, which an ordinary run
+                // hands to the guest's side to poll. Here the body is read
+                // whole before the guest sees any of it, so it is driven
+                // here: left alone, the body arrives only as far as the
+                // first read happened to bring it.
+                let mut io = Box::into_pin(io);
+                let mut io_ended = false;
+                let collected = body.collect();
+                tokio::pin!(collected);
+                let read = loop {
+                    tokio::select! {
+                        read = &mut collected => break read,
+                        _ = &mut io, if !io_ended => io_ended = true,
+                    }
+                };
+                match read {
                     Err(error) => json!({ "error": error.to_string() }),
                     Ok(body) => json!({
                         "status": parts.status.as_u16(),
