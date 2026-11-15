@@ -48,13 +48,8 @@ no policy.
 
 *Why:* Aid-On's domain is Wasm and Almide; the part worth reading and testing
 is the policy, and Almide's tests run it in milliseconds. The native surface
-stays small enough to audit: wasmtime, a binary-format reader for `inspect`,
-a TOML reader, and one stopgap (below).
-
-*Stopgap:* Almide 0.70's http client carries a request body as text, so a
-binary body does not survive it. Blob uploads go through
-`native/engine/upload.rs` until the stdlib client can send bytes
-([almide/almide#4744](https://github.com/almide/almide/issues/4744)).
+stays small enough to audit: wasmtime, a binary-format reader for `inspect`
+and a TOML reader.
 
 ## 4. No default registry
 

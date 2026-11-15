@@ -23,12 +23,9 @@ use wasmtime_wasi_http::{WasiBody, WasiHttpCtx, WasiHttpCtxView, WasiHttpHooks, 
 mod inspect;
 #[path = "engine/serve.rs"]
 mod serve;
-#[path = "engine/upload.rs"]
-mod upload;
 
 pub use inspect::nt_inspect;
 pub use serve::nt_serve;
-pub use upload::nt_http_upload;
 
 /// Exit codes for runs that did not end by the guest's own choice, after the
 /// conventions container users already know: 124 for a deadline, 125 for a

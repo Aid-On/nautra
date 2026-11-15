@@ -2,7 +2,6 @@
 // Every call into the native engine (native/engine.rs). Policy is decided on
 // this side; the engine receives one finished request and applies it.
 
-import http
 import json
 import self.grants
 
@@ -17,9 +16,6 @@ fn nt_inspect(path: String) -> String
 
 @extern(rs, "engine", "nt_toml_to_json")
 fn nt_toml_to_json(text: String) -> String
-
-@extern(rs, "engine", "nt_http_upload")
-fn nt_http_upload(request_json: String) -> String
 
 // What a .wasm file is and which names it imports and exports.
 type Surface = { kind: String, imports: List[String], exports: List[String], size: Int }
@@ -82,24 +78,6 @@ effect fn run(req: Value) -> Outcome = {
   let serving = (value.get_string(req, "listen") ?? "") != ""
   let doc = json.parse(if serving then nt_serve(json.stringify(req)) else nt_run(json.stringify(req)))!
   Outcome { exit_code: value.get_int(doc, "exit_code") ?? 125, error: value.get_string(doc, "error") ?? "" }
-}
-
-// One HTTP request with a file as its body, byte for byte. Almide 0.70's http
-// client carries request bodies as text, so binary uploads go through here.
-effect fn upload(method: String, target: String, headers: List[(String, String)], file: String) -> HttpResponse = {
-  let req = value.object([
-    ("method", value.string(method)),
-    ("url", value.string(target)),
-    ("headers", value.array(headers |> list.map(((name, v)) => value.array([value.string(name), value.string(v)])))),
-    ("path", value.string(file)),
-  ])
-  let doc = json.parse(nt_http_upload(json.stringify(req)))!
-  guard let status = value.get_int(doc, "status") else none => err(value.get_string(doc, "error") ?? "upload failed")!
-  let pairs = (value.get_array(doc, "headers") ?? []) |> list.filter_map((pair) => match value.as_array(pair) {
-    ok([name, v]) => some((value.as_string(name) ?? "", value.as_string(v) ?? "")),
-    _ => none,
-  })
-  http.with_headers(status, value.get_string(doc, "body") ?? "", pairs)
 }
 
 test "a request with no grants opens nothing" {

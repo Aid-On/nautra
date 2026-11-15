@@ -34,7 +34,7 @@ fn short(digest: String) -> String = string.take(string.strip_prefix(digest, "sh
 
 // Rows as aligned columns, two spaces apart.
 fn table(rows: List[List[String]]) -> String = {
-  let columns = rows |> list.map((row) => list.len(row)) |> list.max ?? 0
+  let columns = rows |> list.map(list.len) |> list.max ?? 0
   let widths = list.range(0, columns) |> list.map((c) => rows |> list.map((row) => string.len(list.get(row, c) ?? "")) |> list.max ?? 0)
   rows
     |> list.map((row) => list.zip_with(row, widths, (cell, width) => string.pad_end(cell, width, " ")) |> list.join("  ") |> string.trim_end)

@@ -11,9 +11,7 @@ repository = "https://github.com/Aid-On/nautra"
 allow = ["FS.read", "FS.write", "IO", "Env", "Time", "Net", "Proc", "Rand", "Fan", "Abort"]
 
 # The only native code is the engine: wasmtime, and the two parsers it needs
-# (the wasm binary format for `inspect`, TOML for the Nautrafile). ureq is a
-# stopgap for sending a binary request body, which Almide 0.70's http client
-# cannot do yet; see native/engine/upload.rs.
+# (the wasm binary format for `inspect`, TOML for the Nautrafile).
 [native-deps]
 wasmtime = "49.0.4"
 wasmtime-wasi = "49.0.4"
@@ -26,4 +24,3 @@ tokio = { version = "1", features = ["net", "signal", "time", "rt", "macros"] }
 wasmparser = "0.258.3"
 serde_json = "1"
 toml = "0.8"
-ureq = { version = "2.12", default-features = false, features = ["tls"] }

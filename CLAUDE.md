@@ -21,7 +21,6 @@ proposing a change in direction.
 | `native/engine.rs` | one run applied to wasmtime; the guest's view of the host, built from the request |
 | `native/engine/serve.rs` | an HTTP component served on a published address (`-p`) |
 | `native/engine/inspect.rs` | what a `.wasm` file is, without compiling it |
-| `native/engine/upload.rs` | stopgap: a byte-exact request body (see ADR-0001 §3) |
 | `examples/` | guest programs in Almide, built to `target/wasm` |
 | `ee/` | Nautra Enterprise; a different licence. Core never imports it |
 
@@ -63,7 +62,3 @@ NAUTRA_TEST_REGISTRY=localhost:5057 python3 scripts/integration.py target/nautra
 
 - A local binding named after a module (`option`, `list`, `string`) shadows
   it silently; do not name one that way.
-- Passing a generic stdlib function by name (`list.map(rows, list.len)`) hits
-  a compiler bug in 0.70.0-rc1 (almide/almide#4745); wrap it in a lambda.
-- `http.set_body_bytes` on a request is lossy in 0.70.0-rc1 (the body crosses
-  as text, almide/almide#4744); binary uploads use `engine.upload`.

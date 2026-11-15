@@ -6,11 +6,11 @@
 
 import base64
 import env
+import fs
 import http
 import json
 import secret
 import url
-import self.engine
 import self.oci
 import self.reference
 import self.store
@@ -80,13 +80,11 @@ local effect fn authorize(challenge: String) -> String = {
   }
 }
 
-// `body_file` is the file to send as the request body, or "" for none. A
-// body goes through the engine's uploader, which sends it byte for byte.
+// `body_file` is the file to send as the request body, or "" for none.
 local effect fn exchange(token: String, method: String, target: String, headers: List[(String, String)], body_file: String) -> HttpResponse = {
-  let all = headers + (if token == "" then [] else [("Authorization", token)])
-  let unreachable = (e: String) => "cannot reach ${string.take_while(string.drop(target, 8), (c) => c != "/")}: ${e}"
-  if body_file == "" then http.send(http.new_request(method, target, "", all)) |> result.map_err(unreachable)!
-  else engine.upload(method, target, all, body_file) |> result.map_err(unreachable)!
+  let bare = http.new_request(method, target, "", headers + (if token == "" then [] else [("Authorization", token)]))
+  let req = if body_file == "" then bare else http.set_body_bytes(bare, fs.read_bytes(body_file)!)
+  http.send(req) |> result.map_err((e) => "cannot reach ${string.take_while(string.drop(target, 8), (c) => c != "/")}: ${e}")!
 }
 
 // One request, answering an authentication challenge once.
