@@ -291,11 +291,14 @@ reads = "open"                           # a toolchain reads outside its mounts
 
 The grants are nautra's words, turned into one sandbox request, with nautra's
 stance kept: no network unless named, and reads confined to the mounts and
-the system directories unless `reads = "open"`. Three things differ from a
+the system directories unless `reads = "open"`. Four things differ from a
 Wasm entry, because a native process is a different thing to confine:
 
 - a mount is a host directory seen where it is (`DIR` or `DIR:ro`), with no
   guest path; the command starts in its first mount;
+- every native command may write under `/tmp`, its scratch space, which is
+  the host's own `/tmp`: a read-only mount there is refused, since it could
+  not be kept, and nothing a command must not change belongs there;
 - network is granted by host name (over HTTPS) or by port (`*:8080`), not by
   address and not by both — an entry the sandbox could not hold to its words
   is refused, not run more openly;

@@ -48,6 +48,11 @@ type Plan = {
 local fn is_address(host: String) -> Bool =
   string.contains(host, ":") or (string.to_list(host) |> list.all((c) => string.is_digit(c) or c == "."))
 
+// Whether a path is in what every native command may write: /tmp, by either
+// of the names macOS has for it.
+local fn in_scratch(absolute: String) -> Bool =
+  ["/tmp", "/private/tmp"] |> list.any((root) => absolute == root or string.starts_with(absolute, "${root}/"))
+
 // A mount for a native command is a host directory seen where it is: the
 // sandbox does not move a directory to another path the way a Wasm guest
 // sees one.
@@ -58,6 +63,9 @@ local fn mount(base: String, text: String) -> String! = {
   }
   guard host != "" and not string.contains(host, ":") else err("'${text}': a native command sees host directories where they are; write DIR or DIR:ro, with no guest path")
   let absolute = if path.is_absolute(host) then host else path.join(base, host)
+  // The sandbox gives every command /tmp to write in, as its scratch space.
+  // A directory there cannot be held to "read-only", so it is not promised.
+  guard not (readonly and in_scratch(absolute)) else err("'${text}': a native command can always write under /tmp, its scratch space, so a directory there cannot be mounted read-only; keep it elsewhere")
   if readonly then "${absolute}:ro" else absolute
 }
 
@@ -231,6 +239,9 @@ test "grants become one sandbox request" {
 
 test "what the sandbox cannot hold a native command to is refused" {
   assert(result.is_err(plan(entry(["x"], ["a:/guest"], [], [], [], "", "strict", []))))
+  assert(result.is_err(plan(entry(["x"], ["/tmp/a:ro"], [], [], [], "", "strict", []))))
+  assert(result.is_err(plan(entry(["x"], ["/private/tmp:ro"], [], [], [], "", "strict", []))))
+  assert(result.is_ok(plan(entry(["x"], ["/tmp/a", "/tmpfiles:ro"], [], [], [], "", "strict", []))))
   assert(result.is_err(plan(entry(["x"], [], ["10.0.0.1:443"], [], [], "", "strict", []))))
   assert(result.is_err(plan(entry(["x"], [], ["example.com:8080"], [], [], "", "strict", []))))
   assert(result.is_err(plan(entry(["x"], [], ["example.com", "*:8080"], [], [], "", "strict", []))))
