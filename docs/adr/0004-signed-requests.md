@@ -31,6 +31,13 @@ On the command line, `--sign aws:REGION:SERVICE@HOST[:PORT][,HOST…]`.
   under is not always the first label of its host (`bedrock-runtime` signs
   as `bedrock`), and a table of exceptions would be wrong the day a service
   is added.
+- **The order is curl's.** Tools that sign for a caller agree on the two
+  words, region and service, and on little else: most take them as two named
+  options, and the one compact form in wide use is curl's
+  `--aws-sigv4 aws:amz:REGION:SERVICE`, which is also the order inside the
+  signature. That order is kept here, without `amz`. The two written the
+  other way round are refused, saying so, rather than left for the service
+  to refuse without a reason.
 - **`aws` is the only scheme.** The word is there so another can be added
   without a new key.
 

@@ -147,6 +147,17 @@ fn parse_secret(text: String) -> SecretGrant! = {
   SecretGrant { name: name, hosts: hosts }
 }
 
+// An AWS region ends in a hyphen and a number (us-east-1, us-gov-west-1); no
+// service's signing name does. Only used to tell the two apart: a region
+// that is not AWS's (an S3-compatible service's `auto`) is taken as written.
+local fn looks_like_region(word: String) -> Bool = match string.last_index_of(word, "-") {
+  some(at) => {
+    let digits = string.drop(word, at + 1)
+    digits != "" and string.to_list(digits) |> list.all((c) => string.is_digit(c))
+  },
+  none => false,
+}
+
 // `aws:REGION:SERVICE@HOST[:PORT][,HOST…]`. The port is 443 unless written.
 fn parse_sign(text: String) -> SignGrant! = {
   let how = "write aws:REGION:SERVICE@HOST, for example aws:us-east-1:bedrock@bedrock-runtime.us-east-1.amazonaws.com"
@@ -158,6 +169,10 @@ fn parse_sign(text: String) -> SignGrant! = {
   let region = list.get(words, 1) ?? ""
   let service = list.get(words, 2) ?? ""
   guard list.len(words) == 3 and region != "" and service != "" else err("'${text}' needs a region and a service: ${how}")
+  // The order is curl's (`--aws-sigv4 aws:amz:REGION:SERVICE`) and the
+  // signature's own. Written the other way round it would sign, and be
+  // refused by the service with no word about why.
+  guard not (looks_like_region(service) and not looks_like_region(region)) else err("'${text}' has the region and the service the wrong way round: write aws:${service}:${region}@${places}")
   let hosts = string.split(places, ",") |> list.map((place) => {
     let rule = parse_net(place)!
     guard rule.host != "*" else err("requests are signed for named hosts, not for '*'")
@@ -387,5 +402,8 @@ test "a signed destination names its scheme, region and service" {
   assert(result.is_err(parse_sign("aws::bedrock@host")))
   assert(result.is_err(parse_sign("gcp:r:s@host")))
   assert(result.is_err(parse_sign("aws:r:s@*")))
+  assert_eq(parse_sign("aws:bedrock:us-east-1@h.example"), err("'aws:bedrock:us-east-1@h.example' has the region and the service the wrong way round: write aws:us-east-1:bedrock@h.example"))
+  assert(result.is_err(parse_sign("aws:s3:us-gov-west-1@h.example")))
+  assert_eq(parse_sign("aws:auto:s3@h.example")!.region, "auto")
   assert_eq(list.len(parse_run(["--sign", "aws:r:s@a.example", "app"])!.grants.signs), 1)
 }
