@@ -1,6 +1,6 @@
 # ADR-0004: Requests the host authenticates
 
-Status: proposed, 2026-11-16
+Status: accepted, 2026-11-16
 
 A secret (ADR-0002) is a value: nautra puts it on a request where the guest
 wrote its placeholder. Much of what an agent has to reach takes no such
