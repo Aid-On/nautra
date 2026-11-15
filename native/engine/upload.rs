@@ -5,7 +5,7 @@
 //! request body as text, so a binary body (a Wasm blob being pushed) does not
 //! survive it. Everything else about talking to a registry — the protocol,
 //! authentication, verification — stays in `src/registry.almd`. Remove this
-//! when the stdlib client can send bytes.
+//! when the stdlib client can send bytes (almide/almide#4744).
 
 use std::time::Duration;
 

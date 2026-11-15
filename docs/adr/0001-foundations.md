@@ -53,7 +53,8 @@ a TOML reader, and one stopgap (below).
 
 *Stopgap:* Almide 0.70's http client carries a request body as text, so a
 binary body does not survive it. Blob uploads go through
-`native/engine/upload.rs` until the stdlib client can send bytes.
+`native/engine/upload.rs` until the stdlib client can send bytes
+([almide/almide#4744](https://github.com/almide/almide/issues/4744)).
 
 ## 4. No default registry
 
