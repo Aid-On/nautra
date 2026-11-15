@@ -9,8 +9,8 @@
 #   docker buildx build --platform linux/amd64 \
 #     -f examples/platforms/cloudflare/Dockerfile -t my-tools .
 #
-# Use a released version of the base image in place of `latest`.
-FROM ghcr.io/aid-on/nautra:latest
+# The base image is a released nautra; name the version you mean.
+FROM ghcr.io/aid-on/nautra:0.1.0
 
 COPY --chown=nautra examples/platforms/cloudflare/nautra.toml /home/nautra/tools/nautra.toml
 COPY --chown=nautra target/wasm/read_file.wasm target/wasm/upper.wasm /home/nautra/tools/

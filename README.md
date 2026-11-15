@@ -58,8 +58,22 @@ processes with the host kernel; Nautra's unit is the Wasm binary.
 
 ## Quick start
 
-Build from source (a release binary is not published yet). You need Rust
-1.97 or newer.
+Take a release, or build from source.
+
+**A release.** [Releases](https://github.com/Aid-On/nautra/releases) carry
+`nautra-linux-x86_64`, `nautra-linux-aarch64` and `nautra-macos-aarch64`
+archives with a checksum list; the binary inside is the whole install. The
+Linux binaries need glibc 2.39 (Ubuntu 24.04, Debian 13). The same binary is
+in a container image for linux/amd64 and linux/arm64:
+
+```bash
+docker run --rm -v "$PWD:/w:ro" ghcr.io/aid-on/nautra:0.1.0 run /w/hello.wasm
+```
+
+Releases are prereleases for now: each was built and run through the
+integration suite on its own platform, and nothing more is claimed.
+
+**From source.** You need Rust 1.97 or newer.
 
 ```bash
 git clone https://github.com/Aid-On/nautra && cd nautra
@@ -537,7 +551,7 @@ Not there yet:
 - TLS on a published port, and HTTP/2
 - several workloads together (compose) and networking between them
 - signing, provenance and policy on what may be pulled
-- credential helpers, a compiled-code cache, release binaries
+- credential helpers, a compiled-code cache
 
 ## Editions and licence
 

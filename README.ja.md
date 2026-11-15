@@ -51,7 +51,17 @@ Nautra は、Linux コンテナに対するコンテナエンジンの役割を�
 
 ## クイックスタート
 
-リリースバイナリはまだ公開していないので、ソースからビルドします。Rust 1.97 以降が必要です。
+リリースを使うか、ソースからビルドします。
+
+**リリース。** [Releases](https://github.com/Aid-On/nautra/releases) に `nautra-linux-x86_64`、`nautra-linux-aarch64`、`nautra-macos-aarch64` のアーカイブとチェックサムの一覧があります。中のバイナリ 1 つがインストールのすべてです。Linux のバイナリには glibc 2.39（Ubuntu 24.04、Debian 13）が必要です。同じバイナリを入れたコンテナイメージが linux/amd64 と linux/arm64 向けにあります。
+
+```bash
+docker run --rm -v "$PWD:/w:ro" ghcr.io/aid-on/nautra:0.1.0 run /w/hello.wasm
+```
+
+リリースは当面プレリリースです。それぞれの環境でビルドし、統合テストを通したところまでが保証の範囲です。
+
+**ソースから。** Rust 1.97 以降が必要です。
 
 ```bash
 git clone https://github.com/Aid-On/nautra && cd nautra
@@ -412,7 +422,7 @@ OCI Distribution API に対応したレジストリなら、どれでも使え�
 - 公開したポートの TLS と HTTP/2
 - 複数のワークロードをまとめて動かす機能（compose）と、その間のネットワーク
 - 署名、来歴の証明、pull してよいものを決めるポリシー
-- 認証情報ヘルパー、コンパイル結果のキャッシュ、リリースバイナリ
+- 認証情報ヘルパー、コンパイル結果のキャッシュ
 
 ## エディションとライセンス
 
