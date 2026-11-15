@@ -3,8 +3,9 @@
 A container engine for WebAssembly: build, ship and run `.wasm` workloads with
 exactly the grants the `run` line names. Almide 0.70 for everything that
 decides; Rust for the engine (wasmtime). Design decisions:
-[docs/adr/0001-foundations.md](docs/adr/0001-foundations.md) — read it before
-proposing a change in direction.
+[docs/adr/](docs/adr/) — read them before proposing a change in direction.
+ADR-0001 is the foundation; ADR-0002 is how agents run here and the order
+that work is done in.
 
 ## Layout
 
@@ -20,6 +21,7 @@ proposing a change in direction.
 | `src/runs.almd` | background runs: the record, the log, stop and remove |
 | `src/engine.almd` | every `@extern` into the native side |
 | `native/engine.rs` | one run applied to wasmtime; the guest's view of the host, built from the request |
+| `native/engine/outbound.rs` | outbound `wasi:http`: destinations, secrets, the audit record |
 | `native/engine/serve.rs` | an HTTP component served on a published address (`-p`) |
 | `native/engine/spawn.rs` | `run -d`: nautra started once more with no terminal |
 | `native/engine/inspect.rs` | what a `.wasm` file is, without compiling it |
@@ -57,6 +59,8 @@ NAUTRA_TEST_REGISTRY=localhost:5057 python3 scripts/integration.py target/nautra
 - Text that came from an image or a registry is stripped of control
   characters before it is printed.
 - A name without a registry is never sent anywhere.
+- A secret's real value exists only in the host process: the guest holds a
+  placeholder, and no record, log or run file holds the value.
 - Policy stays in Almide. The native side applies a finished request.
 - Every source file carries the SPDX header of its directory: `Apache-2.0`
   outside `ee/`, `LicenseRef-Nautra-Enterprise` inside.

@@ -4,6 +4,7 @@
 
 import http
 import json
+import secret
 import self.grants
 
 @extern(rs, "engine", "nt_run")
@@ -63,10 +64,25 @@ local fn net_value(g: grants.Grants) -> Value =
     ("allow", value.array(g.net |> list.map((rule) => value.object([("host", value.string(rule.host)), ("port", value.int(rule.port))])))),
   ])
 
+// A secret as the engine needs it: the placeholder the guest holds, the real
+// value, and where the real value may go.
+type BoundSecret = { name: String, placeholder: String, value: Secret[String], hosts: List[grants.NetRule] }
+
+local fn secret_value(s: BoundSecret) -> Value = value.object([
+  ("name", value.string(s.name)),
+  ("placeholder", value.string(s.placeholder)),
+  ("value", value.string(secret.reveal(s.value))),
+  ("hosts", value.array(s.hosts |> list.map((rule) => value.object([("host", value.string(rule.host)), ("port", value.int(rule.port))])))),
+])
+
 // The request document the engine applies. `argv` starts with the name the
 // guest sees itself run as; `env` is already resolved to name/value pairs.
-fn request(path: String, argv: List[String], env: List[(String, String)], g: grants.Grants) -> Value =
+// This is the one place a secret's real value is written out, and it goes
+// nowhere but to the engine in this process.
+fn request(path: String, argv: List[String], env: List[(String, String)], g: grants.Grants, secrets: List[BoundSecret]) -> Value =
   value.object([
+    ("secrets", value.array(secrets |> list.map(secret_value))),
+    ("audit", value.string(g.audit)),
     ("path", value.string(path)),
     ("args", value.array(argv |> list.map(value.string))),
     ("env", value.array(env |> list.map(((name, v)) => value.array([value.string(name), value.string(v)])))),
@@ -115,7 +131,7 @@ effect fn spawn_self(args: List[String], log: String) -> Int = {
 }
 
 test "a request with no grants opens nothing" {
-  let req = request("/x/app.wasm", ["app"], [], grants.nothing())
+  let req = request("/x/app.wasm", ["app"], [], grants.nothing(), [])
   assert_eq(value.get_array(req, "mounts"), some([]))
   assert_eq(value.get_array(req, "env"), some([]))
   assert_eq(value.get(req, "net"), some(value.object([("mode", value.string("none"))])))

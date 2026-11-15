@@ -1,10 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Fetches one URL over HTTP: needs its host granted with --allow-net.
+//
+// When API_TOKEN is set it is sent as a bearer token. Run with
+// `--secret API_TOKEN@HOST`, what this program holds is a placeholder: the
+// real token is put on the request by nautra, and only towards HOST.
 import env
 import http
 
 effect fn main() -> Unit = {
   let target = list.get(env.args(), 0) ?? "http://example.com/"
-  let resp = http.get_response(target)!
+  let headers = match env.get("API_TOKEN") {
+    some(token) => {
+      println("token as this program sees it: ${string.take(token, 14)}…")
+      [("Authorization", "Bearer ${token}")]
+    },
+    none => [],
+  }
+  let resp = http.send(http.new_request("GET", target, "", headers))!
   println("${http.status(resp)} ${string.len(http.body(resp))} characters")
 }

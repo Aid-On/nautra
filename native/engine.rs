@@ -7,8 +7,8 @@
 //! no arguments beyond its own, an empty environment, a closed stdin, no
 //! directory and no network; each field of the request opens one thing.
 
-use std::future::Future;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -17,10 +17,14 @@ use wasmtime::{Config, Engine, Error, Linker, Module, Store, StoreLimits, StoreL
 use wasmtime_wasi::p1::WasiP1Ctx;
 use wasmtime_wasi::sockets::SocketAddrUse;
 use wasmtime_wasi::{FsPerms, I32Exit, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
-use wasmtime_wasi_http::{WasiBody, WasiHttpCtx, WasiHttpCtxView, WasiHttpHooks, WasiHttpView};
+use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
+
+use outbound::{Audit, Outbound};
 
 #[path = "engine/inspect.rs"]
 mod inspect;
+#[path = "engine/outbound.rs"]
+mod outbound;
 #[path = "engine/serve.rs"]
 mod serve;
 #[path = "engine/spawn.rs"]
@@ -99,17 +103,17 @@ struct ComponentCtx {
     table: ResourceTable,
     limits: StoreLimits,
     http: WasiHttpCtx,
-    outbound: HttpGrants,
+    outbound: Outbound,
 }
 
 impl ComponentCtx {
-    fn new(mut wasi: WasiCtxBuilder, request: &Value, limits: &Limits) -> ComponentCtx {
+    fn new(mut wasi: WasiCtxBuilder, request: &Value, limits: &Limits, audit: Option<Arc<Audit>>) -> ComponentCtx {
         ComponentCtx {
             wasi: wasi.build(),
             table: ResourceTable::new(),
             limits: store_limits(limits),
             http: WasiHttpCtx::new(),
-            outbound: HttpGrants::from_request(&request["net"]),
+            outbound: Outbound::of(request, audit),
         }
     }
 }
@@ -123,68 +127,6 @@ impl WasiView for ComponentCtx {
 impl WasiHttpView for ComponentCtx {
     fn http(&mut self) -> WasiHttpCtxView<'_> {
         WasiHttpCtxView { ctx: &mut self.http, table: &mut self.table, hooks: &mut self.outbound }
-    }
-}
-
-/// The destinations a guest may send HTTP requests to: the same network
-/// grants as for sockets, matched here against the host the request names.
-/// `wasi:http` hands the host a URL, not a socket, so the name is what there
-/// is to check; the request is refused before any connection is made.
-struct HttpGrants {
-    rules: Vec<(String, Option<u16>)>,
-}
-
-impl HttpGrants {
-    fn from_request(net: &Value) -> HttpGrants {
-        let rules = match net["mode"].as_str().unwrap_or("none") {
-            "all" => vec![("*".to_owned(), None)],
-            "list" => net["allow"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|entry| {
-                    let port = entry["port"].as_u64().filter(|port| *port != 0).and_then(|port| u16::try_from(port).ok());
-                    (entry["host"].as_str().unwrap_or("*").to_owned(), port)
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
-        HttpGrants { rules }
-    }
-
-    fn admits(&self, host: &str, port: u16) -> bool {
-        let host = host.trim_start_matches('[').trim_end_matches(']');
-        self.rules.iter().any(|(granted, granted_port)| {
-            (granted == "*" || granted.eq_ignore_ascii_case(host)) && granted_port.is_none_or(|granted| granted == port)
-        })
-    }
-}
-
-impl WasiHttpHooks for HttpGrants {
-    fn send_request(
-        &mut self,
-        request: http::Request<WasiBody>,
-        options: Option<wasmtime_wasi_http::RequestOptions>,
-        _fut: Box<dyn Future<Output = Result<(), wasmtime_wasi_http::Error>> + Send>,
-    ) -> Box<
-        dyn Future<
-                Output = Result<
-                    (http::Response<WasiBody>, Box<dyn Future<Output = Result<(), wasmtime_wasi_http::Error>> + Send>),
-                    wasmtime_wasi_http::Error,
-                >,
-            > + Send,
-    > {
-        let secure = request.uri().scheme_str() == Some("https");
-        let port = request.uri().port_u16().unwrap_or(if secure { 443 } else { 80 });
-        let admitted = request.uri().host().is_some_and(|host| self.admits(host, port));
-        Box::new(async move {
-            use http_body_util::BodyExt;
-            if !admitted {
-                return Err(wasmtime_wasi_http::Error::HttpRequestDenied);
-            }
-            let (response, io) = wasmtime_wasi_http::default_send_request(request, options).await?;
-            Ok((response.map(BodyExt::boxed_unsync), Box::new(io) as Box<dyn Future<Output = _> + Send>))
-        })
     }
 }
 
@@ -204,13 +146,17 @@ fn run(request: &Value) -> Value {
         Ok(engine) => engine,
         Err(error) => return refused(format!("engine setup failed: {error}")),
     };
-    let wasi = match wasi_builder(request) {
+    let audit = match Audit::of(request) {
+        Ok(audit) => audit,
+        Err(reason) => return refused(reason),
+    };
+    let wasi = match wasi_builder(request, audit.clone()) {
         Ok(wasi) => wasi,
         Err(reason) => return refused(reason),
     };
     let deadline = Deadline::arm(&engine, limits.timeout_ms);
     let ended = if inspect::is_component(&bytes) {
-        run_component(&engine, &bytes, ComponentCtx::new(wasi, request, &limits), &limits)
+        run_component(&engine, &bytes, ComponentCtx::new(wasi, request, &limits, audit), &limits)
     } else {
         run_module(&engine, &bytes, wasi, &limits)
     };
@@ -267,7 +213,7 @@ impl Drop for Deadline {
 
 /// The guest's whole view of the host, built from the request and nothing
 /// else. Anything the request does not name stays closed.
-fn wasi_builder(request: &Value) -> Result<WasiCtxBuilder, String> {
+fn wasi_builder(request: &Value, audit: Option<Arc<Audit>>) -> Result<WasiCtxBuilder, String> {
     let mut wasi = WasiCtxBuilder::new();
     let args: Vec<String> = strings(&request["args"]);
     wasi.args(&args);
@@ -287,7 +233,7 @@ fn wasi_builder(request: &Value) -> Result<WasiCtxBuilder, String> {
         let perms = if mount["readonly"].as_bool().unwrap_or(false) { FsPerms::ReadOnly } else { FsPerms::ReadWrite };
         wasi.preopened_dir(host, guest, perms).map_err(|error| format!("cannot mount {host}: {error}"))?;
     }
-    open_network(&mut wasi, &request["net"])?;
+    open_network(&mut wasi, &request["net"], audit)?;
     Ok(wasi)
 }
 
@@ -300,7 +246,7 @@ fn strings(value: &Value) -> Vec<String> {
 /// destinations; a host name in it is resolved once, here, before the guest
 /// runs, so the guest cannot steer where a granted name points afterwards.
 /// Listening is never opened by a network grant.
-fn open_network(wasi: &mut WasiCtxBuilder, net: &Value) -> Result<(), String> {
+fn open_network(wasi: &mut WasiCtxBuilder, net: &Value, audit: Option<Arc<Audit>>) -> Result<(), String> {
     let rules: Vec<NetRule> = match net["mode"].as_str().unwrap_or("none") {
         "none" => return Ok(()),
         "all" => vec![NetRule { ip: None, port: None }],
@@ -322,6 +268,9 @@ fn open_network(wasi: &mut WasiCtxBuilder, net: &Value) -> Result<(), String> {
             && addr.ip().is_unspecified()
             && addr.port() == 0;
         let admitted = implicit_bind || (outbound && rules.iter().any(|rule| rule.admits(&addr)));
+        if let (Some(audit), false) = (&audit, implicit_bind) {
+            audit.socket(&addr, &format!("{usage:?}"), admitted);
+        }
         Box::pin(async move { admitted })
     });
     Ok(())

@@ -11,6 +11,11 @@ type NetRule = { host: String, port: Int }
 // An environment variable to set, or (value none) one to copy from the host.
 type EnvGrant = { name: String, value: String? }
 
+// A host variable the workload may use without holding it: the workload is
+// handed a placeholder under the same name, and the real value is put on
+// HTTP requests to these destinations only.
+type SecretGrant = { name: String, hosts: List[NetRule] }
+
 type Grants = {
   mounts: List[Mount],
   env: List[EnvGrant],
@@ -22,6 +27,9 @@ type Grants = {
   stdin: Bool,
   // The address an HTTP service is published on, or "" for an ordinary run.
   publish: String,
+  secrets: List[SecretGrant],
+  // A file every decision at the run's boundary is appended to, or "".
+  audit: String,
 }
 
 // A parsed `nautra run` line: the grants, the image, and the guest's arguments.
@@ -49,6 +57,8 @@ fn nothing() -> Grants = Grants {
   fuel: 0,
   stdin: false,
   publish: "",
+  secrets: [],
+  audit: "",
 }
 
 // `HOST:GUEST[:ro|:rw]`. The guest path is where the workload sees the
@@ -116,6 +126,18 @@ fn parse_publish(text: String) -> String! = {
   "${address}:${port}"
 }
 
+// `NAME@HOST[:PORT][,HOST…]`. The port is 443 unless written.
+fn parse_secret(text: String) -> SecretGrant! = {
+  let (name, places) = string.split_once(text, "@") |> option.to_result("'${text}' binds a secret to no host: write NAME@HOST, for example API_KEY@api.example.com")!
+  guard name != "" and places != "" else err("'${text}' binds a secret to no host: write NAME@HOST, for example API_KEY@api.example.com")
+  let hosts = string.split(places, ",") |> list.map((place) => {
+    let rule = parse_net(place)!
+    guard rule.host != "*" else err("a secret is bound to named hosts, not to '*'")
+    { ...rule, port: if rule.port == 0 then 443 else rule.port }
+  })!
+  SecretGrant { name: name, hosts: hosts }
+}
+
 local fn scaled(text: String, units: List[(String, Int)], what: String) -> Int! = {
   let lower = string.to_lower(text)
   let (digits, factor) = units
@@ -139,6 +161,8 @@ local fn with_value(g: Grants, flag: String, text: String) -> Grants! = match fl
   "-e" | "--env" => { ...g, env: g.env + [parse_env(text)!] },
   "--allow-net" => if text == "*" then { ...g, net_all: true } else { ...g, net: g.net + [parse_net(text)!] },
   "-p" | "--publish" => { ...g, publish: parse_publish(text)! },
+  "--secret" => { ...g, secrets: g.secrets + [parse_secret(text)!] },
+  "--audit" => { ...g, audit: text },
   "-m" | "--memory" => { ...g, memory_bytes: parse_size(text)! },
   "--timeout" => { ...g, timeout_ms: parse_duration(text)! },
   "--fuel" => {
@@ -150,7 +174,7 @@ local fn with_value(g: Grants, flag: String, text: String) -> Grants! = match fl
 }
 
 local fn takes_value(flag: String) -> Bool =
-  list.contains(["-v", "--volume", "-e", "--env", "--allow-net", "-p", "--publish", "-m", "--memory", "--timeout", "--fuel"], flag)
+  list.contains(["-v", "--volume", "-e", "--env", "--allow-net", "-p", "--publish", "--secret", "--audit", "-m", "--memory", "--timeout", "--fuel"], flag)
 
 // Options come before the image; everything after it belongs to the guest.
 fn is_run_name(text: String) -> Bool =
@@ -284,4 +308,13 @@ test "a background run is named, and has no terminal" {
   assert(result.is_err(parse_run(["--name", "x", "app"])))
   assert(result.is_err(parse_run(["-d", "--name", "../x", "app"])))
   assert(not parse_run(["app"])!.detach)
+}
+
+test "a secret is bound to named hosts, on 443 unless said" {
+  assert_eq(parse_secret("API_KEY@api.example.com"), ok(SecretGrant { name: "API_KEY", hosts: [NetRule { host: "api.example.com", port: 443 }] }))
+  assert_eq(parse_secret("K@a.example,127.0.0.1:8080")!.hosts, [NetRule { host: "a.example", port: 443 }, NetRule { host: "127.0.0.1", port: 8080 }])
+  assert(result.is_err(parse_secret("API_KEY")))
+  assert(result.is_err(parse_secret("@host")))
+  assert(result.is_err(parse_secret("K@*")))
+  assert_eq(list.len(parse_run(["--secret", "K@a.example", "--audit", "run.jsonl", "app"])!.grants.secrets), 1)
 }

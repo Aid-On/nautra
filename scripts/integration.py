@@ -11,6 +11,7 @@ address of a scratch OCI registry on this machine (for example
 also check push and pull.
 """
 import http.server
+import json
 import os
 import pathlib
 import signal
@@ -133,6 +134,53 @@ def service_checks(n, wasm):
         expect("a service says where it listens", f"serving on http://127.0.0.1:{port}" in server.stderr.read())
 
 
+def secret_checks(n, wasm, work):
+    """--secret: the guest holds a placeholder; the value reaches only the bound host."""
+    seen = []
+
+    class Recorder(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.send_header("Content-Length", "3")
+            self.end_headers()
+            self.wfile.write(b"ok\n")
+
+        def log_message(self, *args):
+            pass
+
+    def recorder():
+        server = http.server.HTTPServer(("127.0.0.1", 0), Recorder)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server.server_address[1]
+
+    bound, other = recorder(), recorder()
+    token = "real-token-s3cr3t"
+    audit = work / "audit.jsonl"
+    env = {"API_TOKEN": token}
+    got = n("run", "--secret", f"API_TOKEN@127.0.0.1:{bound}", "--audit", audit, wasm("fetch"), f"http://127.0.0.1:{bound}/v1/models?key=q", env=env)
+    check("a secret's host is reachable over http", got, 0, out="200 3 characters")
+    check("the guest holds a placeholder", got, 0, out="nautra-secret-", absent=token)
+    expect("the bound host receives the real value", seen == [f"Bearer {token}"], repr(seen))
+    stolen = n("run", "--secret", f"API_TOKEN@127.0.0.1:{bound}", "--allow-net", f"127.0.0.1:{other}", "--audit", audit, wasm("fetch"), f"http://127.0.0.1:{other}/steal", env=env)
+    check("a secret is not sent to another host", stolen, 1, err="denied", absent=token)
+    expect("the other host received nothing", len(seen) == 1, repr(seen))
+    check("the guest's environment has no real value", n("run", "--secret", "API_TOKEN@api.example.com", wasm("env"), env=env), 0, out="API_TOKEN=nautra-secret-", absent=token)
+    check("a secret's host is not opened to sockets", n("run", "--secret", f"API_TOKEN@127.0.0.1:{bound}", wasm("dial"), "127.0.0.1", bound, env=env), 1, err="permission denied")
+    check("a secret missing from the host is refused", n("run", "--secret", "API_TOKEN@api.example.com", wasm("env")), 125, err="is not set")
+    check("a secret needs a host", n("run", "--secret", "API_TOKEN", wasm("env"), env=env), 125, err="binds a secret to no host")
+
+    n("run", "--allow-net", f"127.0.0.1:{bound}", "--audit", audit, wasm("dial"), "127.0.0.1", bound)
+    text = audit.read_text()
+    records = [json.loads(line) for line in text.splitlines()]
+    allowed = [r for r in records if r["kind"] == "http" and r["decision"] == "allow"]
+    denied = [r for r in records if r["kind"] == "http" and r["decision"] == "deny"]
+    expect("an allowed request is recorded with its status and secret", len(allowed) == 1 and allowed[0]["status"] == 200 and allowed[0]["secrets"] == ["API_TOKEN"] and allowed[0]["path"] == "/v1/models", repr(allowed))
+    expect("a refused request is recorded with its reason", len(denied) == 1 and "not bound" in denied[0]["reason"], repr(denied))
+    expect("a socket connection is recorded", any(r["kind"] == "socket" and r["decision"] == "allow" and r["port"] == bound for r in records), text)
+    expect("the record holds no secret and no query string", token not in text and "key=q" not in text, text)
+
+
 def background_checks(n, wasm):
     """run -d, ps, logs, stop and rm: a run that outlives the command that started it."""
     port = free_port()
@@ -242,6 +290,7 @@ def run_checks(n, work):
     check("-p needs a service", n("run", "-p", free_port(), wasm("hello")), 125, err="no HTTP handler")
     check("-p takes one port, not a mapping", n("run", "-p", "8080:80", wasm("web")), 125, err="no port of its own")
     service_checks(n, wasm)
+    secret_checks(n, wasm, work)
     background_checks(n, wasm)
 
     # Images: build, name, inspect, remove.

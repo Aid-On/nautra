@@ -28,6 +28,9 @@ fn usage() -> String = """
     -v, --volume HOST:GUEST[:ro]   a directory, where the guest sees it
     -e, --env NAME=VALUE | NAME    a variable; a bare NAME copies the host's
         --allow-net HOST:PORT      one destination; HOST, *:PORT, or * for all
+        --secret NAME@HOST         a host variable, put on HTTP requests to HOST only; the
+                                   workload holds a placeholder, never the value
+        --audit FILE               append every network decision of the run to FILE
     -p, --publish [ADDRESS:]PORT   serve an HTTP component there (this machine only by default)
     -i, --interactive              this terminal's stdin
     -m, --memory SIZE              a memory ceiling (64m, 1g)

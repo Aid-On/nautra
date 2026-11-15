@@ -21,7 +21,7 @@
   <a href="#images">Images</a> ·
   <a href="#registries">Registries</a> ·
   <a href="#project-status">Status</a> ·
-  <a href="./docs/adr/0001-foundations.md">Design</a> ·
+  <a href="./docs/adr/">Design</a> ·
   <a href="./LICENSING.md">Licensing</a>
 </p>
 
@@ -89,6 +89,8 @@ it belongs to the workload.
 | `-v HOST:GUEST[:ro]` | one directory, where the guest sees it; `:ro` for reads only |
 | `-e NAME=VALUE`, `-e NAME` | one variable; a bare name copies the host's value |
 | `--allow-net HOST:PORT` | one destination; also `HOST`, `*:PORT`, or `*` for all |
+| `--secret NAME@HOST` | a host variable for HTTP requests to `HOST`; the workload holds a placeholder, never the value |
+| `--audit FILE` | nothing — it appends every network decision of the run to `FILE` |
 | `-p [ADDRESS:]PORT` | where an HTTP service listens; this machine only unless an address is named |
 | `-i` | this terminal's stdin |
 | `-m 64m` | a memory ceiling |
@@ -109,6 +111,27 @@ workload cannot steer where a granted name points. For HTTP, the host named in
 the URL is matched against the grant, and a request anywhere else is refused
 before a connection is made. A mount cannot be climbed out of with `..` or a
 symlink.
+
+### Secrets
+
+A workload that calls an API needs a key, and a workload that holds a key can
+send it anywhere it can reach. `--secret` separates the two:
+
+```text
+$ export API_TOKEN=real-token
+$ nautra run --secret API_TOKEN@api.example.com app.wasm
+```
+
+Inside, `API_TOKEN` is a placeholder such as `nautra-secret-3f9a…`. The
+workload sends it in whatever header its client uses; on a request to
+`api.example.com` nautra replaces it with the real value, and a request that
+carries it anywhere else is refused. The grant also opens HTTPS to that host,
+and nothing more. A host the secret is bound to is trusted with it.
+
+`--audit FILE` appends one line of JSON per network decision — each HTTP
+request with its destination, path, status and the names of the secrets it
+carried, each refusal with its reason, each socket connection. It never
+records a header value, a query string or a secret.
 
 The workload's own exit code is passed through. `125` means nautra refused
 or could not start the run.
@@ -247,6 +270,9 @@ token works as the password).
 on macOS and, in CI, on Linux. WASI 0.3 and its `wasi:http` are still marked
 experimental in wasmtime, and services inherit that. Push and pull are tested against a local
 `registry:2`, and have not yet been verified against public registries.
+
+Next is running agents: tools as images, a composition file, and a record a
+run can be replayed from ([ADR-0002](docs/adr/0002-agents.md)).
 
 Not there yet:
 
