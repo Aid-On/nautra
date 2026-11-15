@@ -30,6 +30,8 @@ type Grants = {
   secrets: List[SecretGrant],
   // A file every decision at the run's boundary is appended to, or "".
   audit: String,
+  // A file the run's exchanges are written to, so it can be replayed, or "".
+  record: String,
 }
 
 // A parsed `nautra run` line: the grants, the image, and the guest's arguments.
@@ -59,6 +61,7 @@ fn nothing() -> Grants = Grants {
   publish: "",
   secrets: [],
   audit: "",
+  record: "",
 }
 
 // `HOST:GUEST[:ro|:rw]`. The guest path is where the workload sees the
@@ -163,6 +166,7 @@ local fn with_value(g: Grants, flag: String, text: String) -> Grants! = match fl
   "-p" | "--publish" => { ...g, publish: parse_publish(text)! },
   "--secret" => { ...g, secrets: g.secrets + [parse_secret(text)!] },
   "--audit" => { ...g, audit: text },
+  "--record" => { ...g, record: text },
   "-m" | "--memory" => { ...g, memory_bytes: parse_size(text)! },
   "--timeout" => { ...g, timeout_ms: parse_duration(text)! },
   "--fuel" => {
@@ -193,7 +197,7 @@ fn option_count(args: List[String]) -> Int = {
 }
 
 local fn takes_value(flag: String) -> Bool =
-  list.contains(["-v", "--volume", "-e", "--env", "--allow-net", "-p", "--publish", "--secret", "--audit", "-m", "--memory", "--timeout", "--fuel"], flag)
+  list.contains(["-v", "--volume", "-e", "--env", "--allow-net", "-p", "--publish", "--secret", "--audit", "--record", "-m", "--memory", "--timeout", "--fuel"], flag)
 
 // Options come before the image; everything after it belongs to the guest.
 fn is_run_name(text: String) -> Bool =
@@ -253,6 +257,7 @@ fn parse_run(args: List[String]) -> RunLine! = {
     }
   }
   guard image != "" else err("run needs an image or a .wasm file")
+  guard grants.record == "" or grants.publish == "" else err("--record is for a run that ends; a published service takes requests from outside, which a record cannot replay")
   guard not (detach and grants.stdin) else err("-d runs without a terminal, so -i has nothing to read from")
   guard name == "" or detach else err("--name names a background run; add -d")
   RunLine { grants: grants, image: image, args: list.drop(args, i), detach: detach, name: name, remove: remove, run_id: run_id }

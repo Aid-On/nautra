@@ -181,6 +181,58 @@ def secret_checks(n, wasm, work):
     expect("the record holds no secret and no query string", token not in text and "key=q" not in text, text)
 
 
+def record_checks(n, project, env, asked, token):
+    """--record, replay and --resume: a run written down, re-run without the world, and continued."""
+    record = project / "run.record"
+    made = n("run", "--record", record, "-f", "agent.toml", "What does the note say?", env=env, cwd=project)
+    check("a recorded run answers as usual", made, 0, out="The note says: THE TIDE IS IN")
+    text = record.read_text()
+    lines = text.splitlines()
+    expect("the record holds no secret", token not in text, "the key is in the record")
+    check("inspect reads a record without running it", n("inspect", record), 0, out="exchanges 5 (3 http, 2 tool)")
+    check("inspect says how the run ended", n("inspect", record), 0, out="finished, exit code 0")
+    check("a record is not written over", n("run", "--record", record, "-f", "agent.toml", "again", env=env, cwd=project), 125, err="cannot start the record")
+
+    before = len(asked)
+    replayed = n("replay", record, cwd=project)
+    check("a replay gives the same answer with no key", replayed, 0, out="The note says: THE TIDE IS IN", err="5 exchange(s) replayed, nothing sent")
+    expect("a replay calls no model", len(asked) == before, f"{len(asked) - before} model call(s)")
+    check("a replay runs where the record was made", n("replay", record, cwd=project.parent), 125, err="was recorded in")
+
+    def variant(name, keep):
+        path = project / name
+        path.write_text("\n".join(keep) + "\n")
+        return path
+
+    entries = [json.loads(line) for line in lines]
+    tool_end = next(i for i, e in enumerate(entries) if "end" in e and "content" in e["end"])
+    changed = list(lines)
+    changed[tool_end] = lines[tool_end].replace("the tide is in", "the tide is out")
+    check("a run that leaves its record is refused", n("replay", variant("changed.record", changed), cwd=project), 3, err="left its record")
+    other = dict(entries[0], wasm="sha256:" + "0" * 64)
+    check("a record is tied to its binary", n("replay", variant("other.record", [json.dumps(other)] + lines[1:]), cwd=project), 125, err="not the one that was recorded")
+    check("a file that is not a record is refused", n("replay", project / "agent.toml", cwd=project), 125, err="is not a nautra record")
+
+    # Stopped after the first model call: the rest is carried out for real.
+    stopped = variant("stopped.record", lines[:3])
+    check("inspect sees a stopped run", n("inspect", stopped), 0, out="stopped after 1 exchange(s)")
+    before = len(asked)
+    resumed = n("run", "--resume", stopped, env=env, cwd=project)
+    check("a stopped run is resumed to its answer", resumed, 0, out="The note says: THE TIDE IS IN", err="resumed after 1 recorded exchange(s)")
+    expect("a resumed run repeats nothing it had done", len(asked) - before == 2, f"{len(asked) - before} model call(s)")
+    check("a resumed run finishes its record", n("inspect", stopped), 0, out="finished, exit code 0")
+    check("a finished run is not resumed", n("run", "--resume", stopped, env=env, cwd=project), 125, err="already finished")
+    check("the completed record replays", n("replay", stopped, cwd=project), 0, err="5 exchange(s) replayed")
+
+    # Stopped with a request sent and no answer written: it may have happened.
+    flight = variant("flight.record", lines[:2])
+    check("inspect sees an exchange in flight", n("inspect", flight), 0, out="in flight")
+    before = len(asked)
+    check("an exchange in flight is not repeated", n("run", "--resume", flight, env=env, cwd=project), 3, err="in flight")
+    expect("nothing was sent for it", len(asked) == before, f"{len(asked) - before} model call(s)")
+    check("a service cannot be recorded", n("run", "--record", project / "x.record", "-p", "8080", "-f", "agent.toml", cwd=project), 125, err="a run that ends")
+
+
 def compose_checks(n, wasm, work):
     """nautra.toml: a workload and the tools it may call, each an image with its own grants."""
     project = work / "project"
@@ -260,6 +312,8 @@ mounts = ["ws:/work:ro"]
     looped = n("run", "-f", project / "agent.toml", "loop", env=env)
     check("the run's tool calls have a ceiling", looped, 0, out="stopped after 3 calls")
     check("an agent needs its key", n("run", "-f", project / "agent.toml", "task"), 125, err="MODEL_KEY is not set")
+    record_checks(n, project, env, asked, token)
+
     started = n("run", "-d", "--name", "agent-bg", "-f", project / "agent.toml", "What does the note say?", env=env)
     check("a composition runs in the background", started, 0)
     for _ in range(100):

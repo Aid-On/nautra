@@ -23,6 +23,7 @@ that work is done in.
 | `src/engine.almd` | every `@extern` into the native side |
 | `native/engine.rs` | one run applied to wasmtime; the guest's view of the host, built from the request |
 | `native/engine/outbound.rs` | outbound `wasi:http`: destinations, secrets, the audit record |
+| `native/engine/journal.rs` | `--record`: the exchanges of a run, replayed or resumed |
 | `native/engine/tools.rs` | the MCP endpoint at `tools.nautra`; a tool call is a captured run |
 | `native/engine/serve.rs` | an HTTP component served on a published address (`-p`) |
 | `native/engine/spawn.rs` | `run -d`: nautra started once more with no terminal |
@@ -61,6 +62,7 @@ NAUTRA_TEST_REGISTRY=localhost:5057 python3 scripts/integration.py target/nautra
 - Text that came from an image or a registry is stripped of control
   characters before it is printed.
 - A name without a registry is never sent anywhere.
+- An exchange a record shows as begun and not ended is never repeated.
 - A secret's real value exists only in the host process: the guest holds a
   placeholder, and no record, log or run file holds the value.
 - Policy stays in Almide. The native side applies a finished request. A

@@ -64,7 +64,10 @@ fn serve(request: Value) -> Result<Value, String> {
         });
     }
     let audit = Audit::of(&request)?;
-    let tools = Tools::of(&request, audit.clone())?;
+    if request["journal"]["path"].as_str().is_some_and(|path| !path.is_empty()) {
+        return Err("a published service takes requests from outside, which a record cannot replay: --record is for a run that ends".into());
+    }
+    let tools = Tools::of(&request, audit.clone(), None)?;
     let serving = Serving { engine, pre, request, limits, audit, tools };
     wasmtime_wasi::runtime::in_tokio(listen_and_serve(address, serving))?;
     Ok(json!({ "exit_code": 0 }))
@@ -116,7 +119,7 @@ impl HandlerState for Serving {
     fn instantiate(&self) -> impl Future<Output = wasmtime::Result<Instance<ComponentCtx, Expiry, Worker>>> + Send {
         async move {
             let wasi = wasi_builder(&self.request, self.audit.clone(), None).map_err(wasmtime::Error::msg)?;
-            let mut store = Store::new(&self.engine, ComponentCtx::new(wasi, &self.request, &self.limits, self.audit.clone(), self.tools.clone()));
+            let mut store = Store::new(&self.engine, ComponentCtx::new(wasi, &self.request, &self.limits, self.audit.clone(), self.tools.clone(), None));
             store.limiter(|ctx| &mut ctx.limits);
             if self.limits.fuel > 0 {
                 store.set_fuel(self.limits.fuel)?;

@@ -9,6 +9,7 @@ import json
 import path
 import process
 import random
+import secret
 import self.compose
 import self.engine
 import self.grants
@@ -103,10 +104,10 @@ local effect fn environment(config: image.Config, wanted: List[grants.EnvGrant])
 
 // Reads each secret from the host's environment and gives it a placeholder:
 // a value that means nothing, for the guest to hold in the secret's place.
-local effect fn bind_secrets(wanted: List[grants.SecretGrant]) -> List[engine.BoundSecret] = {
+local effect fn bind_secrets(wanted: List[grants.SecretGrant], live: Bool) -> List[engine.BoundSecret] = {
   var bound: List[engine.BoundSecret] = []
   for grant in wanted {
-    let held = env.secret(grant.name)! |> option.to_result("secret ${grant.name} is not set in the environment")!
+    let held = if live then env.secret(grant.name)! |> option.to_result("secret ${grant.name} is not set in the environment")! else secret.new("")
     bound = bound + [engine.BoundSecret {
       name: grant.name,
       placeholder: "nautra-secret-${hex.encode(random.bytes(16))}",
@@ -120,7 +121,11 @@ local effect fn bind_secrets(wanted: List[grants.SecretGrant]) -> List[engine.Bo
 // Everything a run needs, decided: the request document the engine applies.
 // The workload is found (and pulled if need be), its grants are checked, and
 // its secrets are bound.
-local effect fn prepare(line: grants.RunLine) -> Value = {
+//
+// `mode` says how the run relates to a record: "record" starts one,
+// "replay" and "resume" follow one, "" has none. `written` is the run line
+// a new record is headed with.
+local effect fn prepare(line: grants.RunLine, mode: String, written: List[String]) -> Value = {
   for mount in line.grants.mounts {
     guard fs.is_dir(mount.host) else err("cannot mount '${mount.host}': it is not a directory")!
   }
@@ -134,22 +139,37 @@ local effect fn prepare(line: grants.RunLine) -> Value = {
   // where to listen.
   let service = engine.inspect(target.path)!.exports |> list.any((name) => string.starts_with(name, "wasi:http/handler") or string.starts_with(name, "wasi:http/incoming-handler"))
   guard not service or line.grants.publish != "" else err("this is an HTTP service: publish it with -p PORT, for example `nautra run -p 8080 ${line.image}`")!
-  let secrets = bind_secrets(line.grants.secrets)!
+  // A replay sends nothing anywhere, so it needs no secret's value.
+  let secrets = bind_secrets(line.grants.secrets, mode != "replay")!
   // The guest holds each secret's placeholder under the secret's name.
   let env_pairs = (environment(target.config, line.grants.env)! |> list.filter(((name, _)) => not list.any(secrets, (s) => s.name == name)))
     + (secrets |> list.map((s) => (s.name, s.placeholder)))
-  engine.request(target.path, argv, env_pairs, line.grants, secrets)
+  let request = engine.request(target.path, argv, env_pairs, line.grants, secrets)
+  if mode == "" then request else {
+    // A record is tied to the exact binary it was made with.
+    let header = value.object([
+      ("wasm", value.string(store.digest_of(fs.read_bytes(target.path)!))),
+      ("run", value.array(written |> list.map(value.string))),
+      ("cwd", value.string(env.cwd()!)),
+    ])
+    value.merge(request, value.object([("journal", value.object([
+      ("path", value.string(line.grants.record)),
+      ("mode", value.string(mode)),
+      ("header", header),
+    ]))]))
+  }
 }
 
 // One tool as the engine needs it: its name and schema for the workload to
 // see, and the whole request its image runs under each time it is called.
 // A tool's options are judged by the same parser as a `run` line's.
-local effect fn tool_entry(t: compose.Tool, audit: String) -> Value = {
+local effect fn tool_entry(t: compose.Tool, audit: String, live: Bool) -> Value = {
   let parsed = grants.parse_run(t.options + [t.image]) |> result.map_err((e) => "tool ${t.name}: ${e}")!
-  // What a tool does at its own boundary goes in the same record as the
+  // What a tool does at its own boundary goes in the same audit as the
   // workload that called it.
   let line = { ...parsed, grants: { ...parsed.grants, audit: audit } }
-  let request = prepare(line) |> result.map_err((e) => "tool ${t.name}: ${e}")!
+  // A replay is given each tool's recorded result, so no tool is prepared.
+  let request = if live then prepare(line, "", []) |> result.map_err((e) => "tool ${t.name}: ${e}")! else value.null()
   value.object([
     ("name", value.string(t.name)),
     ("description", value.string(t.description)),
@@ -161,13 +181,13 @@ local effect fn tool_entry(t: compose.Tool, audit: String) -> Value = {
 
 // One run on this process, to its end: what `run` does, and what the
 // process behind a background run does.
-local effect fn run_here(line: grants.RunLine, composed: compose.Composition?) -> Int = {
-  let base = prepare(line)!
+local effect fn run_here(line: grants.RunLine, composed: compose.Composition?, mode: String, written: List[String]) -> Int = {
+  let base = prepare(line, mode, written)!
   let request = match composed {
     some(c) => {
       var tools: List[Value] = []
       for t in c.tools {
-        tools = tools + [tool_entry(t, line.grants.audit)!]
+        tools = tools + [tool_entry(t, line.grants.audit, mode != "replay")!]
       }
       value.merge(base, value.object([("tools", value.array(tools)), ("max_tool_calls", value.int(c.max_tool_calls))]))
     },
@@ -176,8 +196,49 @@ local effect fn run_here(line: grants.RunLine, composed: compose.Composition?) -
   let outcome = engine.run(request)!
   if outcome.error != "" then {
     eprintln("nautra: ${outcome.error}")
+  } else if mode == "replay" then {
+    eprintln("nautra: the run matches its record: ${outcome.replayed} exchange(s) replayed, nothing sent")
+  } else if mode == "resume" then {
+    eprintln("nautra: resumed after ${outcome.replayed} recorded exchange(s)")
   }
   outcome.exit_code
+}
+
+// A run line as a record keeps it: without the options that are about this
+// one invocation rather than about the run.
+fn written_line(args: List[String]) -> List[String] = {
+  let n = grants.option_count(args)
+  var kept: List[String] = []
+  var skip = false
+  for option in list.take(args, n) {
+    if skip then {
+      skip = false
+    } else if list.contains(["--record", "--name", "--run-id"], option) then {
+      skip = true
+    } else if not list.contains(["-d", "--detach", "--rm"], option) and not list.any(["--record=", "--name=", "--run-id="], (p) => string.starts_with(option, p)) then {
+      kept = kept + [option]
+    }
+  }
+  kept + list.drop(args, n)
+}
+
+// The first line of a record, when the file is one.
+local effect fn record_header(file: String) -> Value? = {
+  let first = fs.read_text(file)? |> option.flat_map((text) => list.first(string.lines(text)))
+  first |> option.flat_map((line) => json.parse(line)?) |> option.filter((doc) => value.get_int(doc, "record") == some(1))
+}
+
+// Runs again the line a record was made with, following the record:
+// "replay" answers every exchange from it, "resume" continues after it.
+local effect fn follow_record(file: String, mode: String) -> Int = {
+  let header = record_header(file)! |> option.to_result("${file} is not a nautra record")!
+  let written = (value.get_array(header, "run") ?? []) |> list.filter_map((arg) => value.as_string(arg)?)
+  let made_in = value.get_string(header, "cwd") ?? ""
+  guard made_in == "" or made_in == env.cwd()! else err("this run was recorded in ${made_in}; run this from there, so its paths mean the same")!
+  let (expanded, composed) = compose.expand(written)!
+  let parsed = grants.parse_run(expanded)!
+  let line = { ...parsed, grants: { ...parsed.grants, record: file } }
+  run_here(line, composed, mode, written)!
 }
 
 // Starts a run in the background and prints its id. Everything that can be
@@ -223,15 +284,22 @@ local effect fn start_detached(args: List[String], line: grants.RunLine) -> Int 
   }
 }
 
-local effect fn cmd_run(args: List[String]) -> Int = {
+local effect fn cmd_run(args: List[String]) -> Int = match args {
+  ["--resume", file] => follow_record(file, "resume")!,
+  _ => start_run(args)!,
+}
+
+local effect fn start_run(args: List[String]) -> Int = {
   let (expanded, composed) = compose.expand(args)!
   let line = grants.parse_run(expanded)!
+  let mode = if line.grants.record == "" then "" else "record"
+  let written = written_line(args)
   if line.detach then start_detached(args, line)!
-  else if line.run_id == "" then run_here(line, composed)!
+  else if line.run_id == "" then run_here(line, composed, mode, written)!
   else {
     // This process is a background run: it reports to its record.
     runs.await_record(line.run_id)!
-    let code = match run_here(line, composed) {
+    let code = match run_here(line, composed, mode, written) {
       ok(c) => c,
       err(message) => {
         eprintln("nautra: ${message}")
@@ -398,9 +466,40 @@ local fn surface_lines(kind: String, size: Int, imports: List[String]) -> List[S
   ]
 }
 
+// What a record holds, read without running anything: the workload, the
+// line it was run with, and how far the run got.
+local effect fn record_lines(file: String) -> List[String] = {
+  let entries = string.lines(fs.read_text(file)!) |> list.filter_map((line) => json.parse(line)?)
+  let header = list.first(entries) ?? value.null()
+  let begun = entries |> list.filter_map((e) => value.get(e, "begin"))
+  let ended = entries |> list.count((e) => option.is_some(value.get(e, "end")))
+  let of_kind = (kind: String) => begun |> list.count((b) => value.get_string(b, "kind") == some(kind))
+  let exit = entries |> list.find_map((e) => value.get_int(e, "exit"))
+  let state = match exit {
+    some(code) => "finished, exit code ${code}",
+    none => if ended < list.len(begun) then "stopped with an exchange in flight; it cannot be resumed past that point" else "stopped after ${ended} exchange(s); `nautra run --resume ${file}` continues it",
+  }
+  let written = (value.get_array(header, "run") ?? []) |> list.filter_map((arg) => value.as_string(arg)?)
+  [
+    "record    ${file}",
+    "wasm      ${value.get_string(header, "wasm") ?? "?"}",
+    "run       ${image.printable(list.join(written, " "))}",
+    "in        ${image.printable(value.get_string(header, "cwd") ?? "?")}",
+    "exchanges ${list.len(begun)} (${of_kind("http")} http, ${of_kind("tool")} tool)",
+    "state     ${state}",
+  ]
+}
+
+local effect fn cmd_replay(args: List[String]) -> Int = match args {
+  [file] => follow_record(file, "replay")!,
+  _ => err("replay takes one record: nautra replay FILE")!,
+}
+
 local effect fn cmd_inspect(args: List[String]) -> Int = {
-  let text = list.get(args, 0) |> option.to_result("inspect needs an image or a .wasm file")!
-  if fs.is_file(text) then {
+  let text = list.get(args, 0) |> option.to_result("inspect needs an image, a .wasm file or a record")!
+  if option.is_some(record_header(text)!) then {
+    println(list.join(record_lines(text)!, "\n"))
+  } else if fs.is_file(text) then {
     let surface = engine.inspect(text)!
     println((["file      ${text}"] + surface_lines(surface.kind, surface.size, surface.imports)) |> list.join("\n"))
   } else {
@@ -477,6 +576,7 @@ local effect fn dispatch(args: List[String]) -> Int = {
     "build" => cmd_build(rest)!,
     "images" | "image" | "ls" => cmd_images()!,
     "inspect" => cmd_inspect(rest)!,
+    "replay" => cmd_replay(rest)!,
     "tag" => cmd_tag(rest)!,
     "rmi" => cmd_rmi(rest)!,
     "ps" => cmd_ps(rest)!,

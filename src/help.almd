@@ -9,6 +9,9 @@ fn usage() -> String = """
 
     run [grants] IMAGE|FILE.wasm [args…]   run a workload with exactly what you grant it
     run -f nautra.toml [args…]              run a workload with the tools its file gives it
+    run --record FILE …                     also write the run's exchanges to FILE
+    run --resume FILE                       continue a recorded run that stopped
+    replay FILE                             re-run a recorded run from FILE; nothing is sent
     run -d [--name NAME] …                  the same, in the background; prints the run's id
     ps [-a]                                 list background runs (-a: ended ones too)
     logs [-f] RUN                           what a background run has written (-f: keep following)
@@ -16,7 +19,7 @@ fn usage() -> String = """
     rm [-f] RUN…                            forget a background run and its log
     build [-t NAME] [-f Nautrafile] [PATH]  package a .wasm file as an image
     images                                  list stored images
-    inspect IMAGE|FILE.wasm                 what an image is, what it asks for, what it can reach
+    inspect IMAGE|FILE.wasm|RECORD          what it is: an image's reach and wants, a record's run
     tag SOURCE NAME                         give a stored image another name
     rmi IMAGE…                              remove stored images
     pull IMAGE                              fetch an image from an OCI registry

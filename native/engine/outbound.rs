@@ -14,9 +14,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use http::HeaderValue;
+use hyper::body::Bytes;
 use serde_json::{json, Value};
 use wasmtime_wasi_http::{Error, RequestOptions, WasiBody, WasiHttpHooks};
 
+use super::journal::Journal;
 use super::tools::{self, Tools};
 
 /// The record of what a run did at its boundary: one JSON object per line,
@@ -105,6 +107,7 @@ pub(super) struct Outbound {
     secrets: Vec<Secret>,
     audit: Option<Arc<Audit>>,
     tools: Option<Arc<Tools>>,
+    journal: Option<Arc<Journal>>,
 }
 
 /// What was decided about one request before it was sent.
@@ -114,7 +117,7 @@ struct Verdict {
 }
 
 impl Outbound {
-    pub(super) fn of(request: &Value, audit: Option<Arc<Audit>>, tools: Option<Arc<Tools>>) -> Outbound {
+    pub(super) fn of(request: &Value, audit: Option<Arc<Audit>>, tools: Option<Arc<Tools>>, journal: Option<Arc<Journal>>) -> Outbound {
         let net = &request["net"];
         let rules = match net["mode"].as_str().unwrap_or("none") {
             "all" => vec![("*".to_owned(), None)],
@@ -137,7 +140,7 @@ impl Outbound {
         for secret in &secrets {
             rules.extend(secret.hosts.iter().map(|(host, port)| (host.clone(), Some(*port))));
         }
-        Outbound { rules, secrets, audit, tools }
+        Outbound { rules, secrets, audit, tools, journal }
     }
 
     fn admits(&self, host: &str, port: u16) -> bool {
@@ -219,13 +222,91 @@ async fn answer_locally(tools: Option<Arc<Tools>>, request: http::Request<WasiBo
         return Err(Error::HttpRequestDenied);
     }
     let answer = tools.answer(&body).await;
-    let mut response = http::Response::new(http_body_util::Full::new(hyper::body::Bytes::from(answer.body)).map_err(|never| match never {}).boxed_unsync());
+    let mut response = http::Response::new(whole(Bytes::from(answer.body)));
     *response.status_mut() = http::StatusCode::from_u16(answer.status).unwrap_or(http::StatusCode::OK);
     response.headers_mut().insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     Ok((response, Box::new(async { Ok(()) }) as Box<dyn Future<Output = _> + Send>))
 }
 
 type Sent = Result<(http::Response<WasiBody>, Box<dyn Future<Output = Result<(), Error>> + Send>), Error>;
+
+fn whole(bytes: Bytes) -> WasiBody {
+    use http_body_util::BodyExt;
+    http_body_util::Full::new(bytes).map_err(|never| match never {}).boxed_unsync()
+}
+
+/// A request sent as it is, its response streamed back: an ordinary run.
+async fn send_live(request: http::Request<WasiBody>, options: Option<RequestOptions>, verdict: Verdict, mut record: Value, audit: Option<Arc<Audit>>) -> Sent {
+    use http_body_util::BodyExt;
+    if let Some(reason) = verdict.refusal {
+        record["reason"] = json!(reason);
+        if let Some(audit) = &audit {
+            audit.record(record);
+        }
+        return Err(Error::HttpRequestDenied);
+    }
+    let sent = wasmtime_wasi_http::default_send_request(request, options).await;
+    match &sent {
+        Ok((response, _)) => record["status"] = json!(response.status().as_u16()),
+        Err(error) => record["error"] = json!(error.to_string()),
+    }
+    if let Some(audit) = &audit {
+        audit.record(record);
+    }
+    let (response, io) = sent?;
+    Ok((response.map(BodyExt::boxed_unsync), Box::new(io) as Box<dyn Future<Output = _> + Send>))
+}
+
+/// A request under a record. The request and the response are read whole —
+/// the request to say exactly what was asked, the response to keep it — so a
+/// streamed response arrives at the guest all at once. What was asked is the
+/// method, the URL and a digest of the body; headers are not part of it, so
+/// no secret is.
+async fn send_recorded(journal: Arc<Journal>, request: http::Request<WasiBody>, options: Option<RequestOptions>, verdict: Verdict, record: Value, audit: Option<Arc<Audit>>) -> Sent {
+    use base64::Engine as _;
+    use http_body_util::BodyExt;
+    use sha2::Digest;
+    let (parts, body) = request.into_parts();
+    let body = body.collect().await?.to_bytes();
+    let digest: String = sha2::Sha256::digest(&body).iter().map(|byte| format!("{byte:02x}")).collect();
+    let begin = json!({ "kind": "http", "method": parts.method.as_str(), "url": parts.uri.to_string(), "body_sha256": digest });
+    let live = async {
+        let request = http::Request::from_parts(parts, whole(body));
+        match send_live(request, options, verdict, record, audit).await {
+            Err(Error::HttpRequestDenied) => json!({ "denied": true }),
+            Err(error) => json!({ "error": error.to_string() }),
+            Ok((response, _io)) => {
+                let (parts, body) = response.into_parts();
+                match body.collect().await {
+                    Err(error) => json!({ "error": error.to_string() }),
+                    Ok(body) => json!({
+                        "status": parts.status.as_u16(),
+                        "headers": parts.headers.iter().filter_map(|(name, value)| Some(json!([name.as_str(), value.to_str().ok()?]))).collect::<Vec<_>>(),
+                        "body": base64::engine::general_purpose::STANDARD.encode(body.to_bytes()),
+                    }),
+                }
+            }
+        }
+    };
+    let end = journal.exchange(begin, live).await;
+    if end["denied"] == json!(true) || !end["fault"].is_null() {
+        return Err(Error::HttpRequestDenied);
+    }
+    if let Some(error) = end["error"].as_str() {
+        return Err(Error::InternalError(Some(error.to_owned())));
+    }
+    let body = base64::engine::general_purpose::STANDARD.decode(end["body"].as_str().unwrap_or("")).unwrap_or_default();
+    let mut response = http::Response::new(whole(Bytes::from(body)));
+    *response.status_mut() = http::StatusCode::from_u16(end["status"].as_u64().unwrap_or(200) as u16).unwrap_or(http::StatusCode::OK);
+    for pair in end["headers"].as_array().into_iter().flatten() {
+        if let (Some(name), Some(value)) = (pair[0].as_str(), pair[1].as_str()) {
+            if let (Ok(name), Ok(value)) = (http::HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_str(value)) {
+                response.headers_mut().append(name, value);
+            }
+        }
+    }
+    Ok((response, Box::new(async { Ok(()) }) as Box<dyn Future<Output = _> + Send>))
+}
 
 impl WasiHttpHooks for Outbound {
     fn send_request(
@@ -241,9 +322,9 @@ impl WasiHttpHooks for Outbound {
             return Box::new(answer_locally(self.tools.clone(), request));
         }
         let verdict = self.decide(&mut request, &host, port, secure);
-        // The record names where a request went and what it carried, never
+        // The audit names where a request went and what it carried, never
         // the query string or a header value.
-        let mut record = json!({
+        let record = json!({
             "kind": "http",
             "decision": if verdict.refusal.is_none() { "allow" } else { "deny" },
             "method": request.method().as_str(),
@@ -254,25 +335,9 @@ impl WasiHttpHooks for Outbound {
             "secrets": verdict.secrets,
         });
         let audit = self.audit.clone();
-        Box::new(async move {
-            use http_body_util::BodyExt;
-            if let Some(reason) = verdict.refusal {
-                record["reason"] = json!(reason);
-                if let Some(audit) = &audit {
-                    audit.record(record);
-                }
-                return Err(Error::HttpRequestDenied);
-            }
-            let sent = wasmtime_wasi_http::default_send_request(request, options).await;
-            match &sent {
-                Ok((response, _)) => record["status"] = json!(response.status().as_u16()),
-                Err(error) => record["error"] = json!(error.to_string()),
-            }
-            if let Some(audit) = &audit {
-                audit.record(record);
-            }
-            let (response, io) = sent?;
-            Ok((response.map(BodyExt::boxed_unsync), Box::new(io) as Box<dyn Future<Output = _> + Send>))
-        })
+        match self.journal.clone() {
+            Some(journal) => Box::new(send_recorded(journal, request, options, verdict, record, audit)),
+            None => Box::new(send_live(request, options, verdict, record, audit)),
+        }
     }
 }

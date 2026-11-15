@@ -213,6 +213,47 @@ recorded beside the network decisions, the tools' own included.
 [`examples/agent`](examples/agent) is a complete agent in Almide, about a
 hundred lines, with two tools.
 
+### Record, replay, resume
+
+`--record FILE` writes down every exchange at a run's boundary, in order:
+each outbound HTTP request with its response, each tool call with its result.
+
+```text
+$ nautra run --record run.record -f nautra.toml "What does the note say?"
+The note says: THE TIDE IS IN
+
+$ nautra inspect run.record
+record    run.record
+wasm      sha256:…
+run       -f nautra.toml What does the note say?
+exchanges 5 (3 http, 2 tool)
+state     finished, exit code 0
+
+$ nautra replay run.record
+The note says: THE TIDE IS IN
+nautra: the run matches its record: 5 exchange(s) replayed, nothing sent
+```
+
+A replay runs the workload again and answers every exchange from the record:
+no model is called, no tool is started, no key is needed. If the workload asks
+for anything other than what the record has next, the run has left its record
+and ends with exit code 3 — so a replay is also a check that the same binary
+still makes the same decisions.
+
+A run that stopped part-way is continued with `nautra run --resume FILE`: the
+recorded exchanges are replayed, and the run goes on for real from there,
+appending to the record. Each exchange is written in two steps, the request
+before it is sent and the answer after, so a run that stopped in between is
+known to have stopped there. That exchange may or may not have taken effect;
+it is not repeated, and the run is not resumed past it.
+
+A record is tied to the exact binary it was made with and is replayed from
+the directory it was made in. It holds what the workload received, so it is as
+private as the run was; it never holds a secret, because request headers are
+not recorded. Under `--record`, a streamed response reaches the workload all
+at once. The clock and random numbers are not recorded, so a workload whose
+requests depend on them will leave its record.
+
 ## Background runs
 
 `-d` starts a run in the background and prints its id. There is no daemon
@@ -330,9 +371,9 @@ experimental in wasmtime, and services inherit that. Push and pull are tested ag
 `registry:2`, and have not yet been verified against public registries.
 
 Agents are being built in the order [ADR-0002](docs/adr/0002-agents.md)
-gives. Secrets, the record of decisions, and tools are in; replaying a run
-from a record, checks before a tool call and before finishing, delegation to
-other agents, remote MCP servers, and confining native commands are not.
+gives. Secrets, the audit of decisions, tools, and record / replay / resume
+are in; checks before a tool call and before finishing, delegation to other
+agents, remote MCP servers, and confining native commands are not.
 
 Not there yet:
 

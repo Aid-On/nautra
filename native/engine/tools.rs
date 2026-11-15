@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
+use super::journal::Journal;
 use super::outbound::Audit;
 
 /// The name a guest sends MCP requests to.
@@ -40,6 +41,7 @@ pub(super) struct Tools {
     /// Calls left across every tool, when the run has a ceiling.
     left: Mutex<Option<u64>>,
     audit: Option<Arc<Audit>>,
+    journal: Option<Arc<Journal>>,
 }
 
 /// One JSON-RPC answer: an HTTP status and a body (empty for a notification).
@@ -52,7 +54,7 @@ impl Tools {
     /// Reads the tools a run request declares; `None` when it declares none.
     /// Every input schema is compiled here, so a schema that is not one stops
     /// the run before the guest starts.
-    pub(super) fn of(request: &Value, audit: Option<Arc<Audit>>) -> Result<Option<Arc<Tools>>, String> {
+    pub(super) fn of(request: &Value, audit: Option<Arc<Audit>>, journal: Option<Arc<Journal>>) -> Result<Option<Arc<Tools>>, String> {
         let entries: Vec<&Value> = request["tools"].as_array().into_iter().flatten().collect();
         if entries.is_empty() {
             return Ok(None);
@@ -72,7 +74,7 @@ impl Tools {
             });
         }
         let left = Mutex::new(request["max_tool_calls"].as_u64().filter(|max| *max > 0));
-        Ok(Some(Arc::new(Tools { tools, left, audit })))
+        Ok(Some(Arc::new(Tools { tools, left, audit, journal })))
     }
 
     /// Answers one MCP request.
@@ -133,9 +135,25 @@ impl Tools {
             self.record(name, "deny", json!({ "reason": "the tool's calls are used up" }));
             return Ok(failed(format!("{name} has used up its calls for this run")));
         }
+        // Under a record, the tool is run once, when the run is first made;
+        // a replay is given the result it produced then.
+        let live = self.run(tool, arguments.clone());
+        let result = match &self.journal {
+            Some(journal) => journal.exchange(json!({ "kind": "tool", "name": name, "arguments": arguments }), live).await,
+            None => live.await,
+        };
+        Ok(match result["fault"].as_str() {
+            Some(fault) => failed(format!("this run has left its record: {fault}")),
+            None => result,
+        })
+    }
+
+    /// Runs the tool's image and turns how it ended into an MCP result.
+    async fn run(&self, tool: &Tool, arguments: Value) -> Value {
+        let name = &tool.name;
         let outcome = run_tool(tool.request.clone(), arguments.to_string().into_bytes()).await;
         self.record(name, "allow", json!({ "exit_code": outcome.exit_code }));
-        Ok(if outcome.exit_code == 0 {
+        if outcome.exit_code == 0 {
             json!({ "content": [{ "type": "text", "text": outcome.stdout.trim_end() }], "isError": false })
         } else {
             let said = [outcome.error.as_str(), outcome.stderr.trim_end(), outcome.stdout.trim_end()]
@@ -144,7 +162,7 @@ impl Tools {
                 .collect::<Vec<_>>()
                 .join("\n");
             failed(if said.is_empty() { format!("{name} ended with exit code {}", outcome.exit_code) } else { said })
-        })
+        }
     }
 
     fn record(&self, name: &str, decision: &str, mut more: Value) {

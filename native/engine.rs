@@ -20,11 +20,14 @@ use wasmtime_wasi::sockets::SocketAddrUse;
 use wasmtime_wasi::{FsPerms, I32Exit, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
+use journal::Journal;
 use outbound::{Audit, Outbound};
 use tools::Tools;
 
 #[path = "engine/inspect.rs"]
 mod inspect;
+#[path = "engine/journal.rs"]
+mod journal;
 #[path = "engine/outbound.rs"]
 mod outbound;
 #[path = "engine/serve.rs"]
@@ -46,6 +49,8 @@ pub use upload::nt_http_upload;
 /// run the engine refused or could not start, 137 for a resource ceiling.
 const EXIT_TIMEOUT: i64 = 124;
 const EXIT_REFUSED: i64 = 125;
+/// A replayed or resumed run that did not follow its record.
+const EXIT_LEFT_RECORD: i64 = 3;
 const EXIT_TRAPPED: i64 = 134;
 const EXIT_CEILING: i64 = 137;
 
@@ -111,13 +116,13 @@ struct ComponentCtx {
 }
 
 impl ComponentCtx {
-    fn new(mut wasi: WasiCtxBuilder, request: &Value, limits: &Limits, audit: Option<Arc<Audit>>, tools: Option<Arc<Tools>>) -> ComponentCtx {
+    fn new(mut wasi: WasiCtxBuilder, request: &Value, limits: &Limits, audit: Option<Arc<Audit>>, tools: Option<Arc<Tools>>, journal: Option<Arc<Journal>>) -> ComponentCtx {
         ComponentCtx {
             wasi: wasi.build(),
             table: ResourceTable::new(),
             limits: store_limits(limits),
             http: WasiHttpCtx::new(),
-            outbound: Outbound::of(request, audit, tools),
+            outbound: Outbound::of(request, audit, tools, journal),
         }
     }
 }
@@ -184,11 +189,12 @@ fn run_with(request: &Value, capture: Option<&Capture>) -> Value {
         Err(error) => return refused(format!("engine setup failed: {error}")),
     };
     let prepared = Audit::of(request).and_then(|audit| {
-        let tools = Tools::of(request, audit.clone())?;
+        let journal = Journal::of(request)?;
+        let tools = Tools::of(request, audit.clone(), journal.clone())?;
         let wasi = wasi_builder(request, audit.clone(), capture)?;
-        Ok((audit, tools, wasi))
+        Ok((audit, journal, tools, wasi))
     });
-    let (audit, tools, wasi) = match prepared {
+    let (audit, journal, tools, wasi) = match prepared {
         Ok(prepared) => prepared,
         Err(reason) => return refused(reason),
     };
@@ -198,15 +204,22 @@ fn run_with(request: &Value, capture: Option<&Capture>) -> Value {
     }
     let deadline = Deadline::arm(&engine, limits.timeout_ms);
     let ended = if component {
-        run_component(&engine, &bytes, ComponentCtx::new(wasi, request, &limits, audit, tools), &limits)
+        run_component(&engine, &bytes, ComponentCtx::new(wasi, request, &limits, audit, tools, journal.clone()), &limits)
     } else {
         run_module(&engine, &bytes, wasi, &limits)
     };
     drop(deadline);
-    match ended {
+    let mut report = match ended {
         Ok(result) => exit_report(result, &limits),
-        Err(reason) => refused(reason),
+        Err(reason) => return refused(reason),
+    };
+    if let Some(journal) = &journal {
+        report["replayed"] = json!(journal.replayed());
+        if let Err(reason) = journal.finish(report["exit_code"].as_i64().unwrap_or(EXIT_REFUSED)) {
+            return json!({ "exit_code": EXIT_LEFT_RECORD, "error": format!("the run left its record: {reason}") });
+        }
     }
+    report
 }
 
 /// Fuel and epoch checks cost time in every loop, so each is compiled in only

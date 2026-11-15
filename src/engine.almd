@@ -28,8 +28,9 @@ fn nt_http_upload(request_json: String) -> String
 // What a .wasm file is and which names it imports and exports.
 type Surface = { kind: String, imports: List[String], exports: List[String], size: Int }
 
-// How a run ended. `error` is empty when the guest chose its own exit.
-type Outcome = { exit_code: Int, error: String }
+// How a run ended. `error` is empty when the guest chose its own exit;
+// `replayed` counts the exchanges that were answered from a record.
+type Outcome = { exit_code: Int, error: String, replayed: Int }
 
 local fn strings(doc: Value, key: String) -> List[String] =
   (value.get_array(doc, key) ?? []) |> list.filter_map((item) => value.as_string(item)?)
@@ -100,7 +101,11 @@ fn request(path: String, argv: List[String], env: List[(String, String)], g: gra
 effect fn run(req: Value) -> Outcome = {
   let serving = (value.get_string(req, "listen") ?? "") != ""
   let doc = json.parse(if serving then nt_serve(json.stringify(req)) else nt_run(json.stringify(req)))!
-  Outcome { exit_code: value.get_int(doc, "exit_code") ?? 125, error: value.get_string(doc, "error") ?? "" }
+  Outcome {
+    exit_code: value.get_int(doc, "exit_code") ?? 125,
+    error: value.get_string(doc, "error") ?? "",
+    replayed: value.get_int(doc, "replayed") ?? 0,
+  }
 }
 
 // One HTTP request with a file as its body, byte for byte. Almide 0.70's http

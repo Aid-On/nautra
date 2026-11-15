@@ -1,7 +1,7 @@
 # ADR-0002: Agents
 
 Status: accepted (2026-11-15). Implemented so far: §2 (secrets), §3 (tools),
-§4 for one workload and its tools, and §5's `--audit`.
+§4 for one workload and its tools, and §5 (the audit and the record).
 
 Nautra is to be an environment agents run in, and to do everything
 [Porta](https://github.com/almide/porta) does. Porta grew its agent runtime
@@ -83,10 +83,28 @@ outbound HTTP request (destination, path, which secrets it carried, the
 status or the refusal and its reason) and each socket use. It never holds a
 header value, a query string or a secret.
 
-`--record FILE` will extend this to everything a run needs to be reproduced
-— responses, tool results, clock and randomness — so that `nautra replay`
-re-runs the guest with no model and no tool invoked, and an interrupted run
-can be resumed. It is not specific to agents.
+`--record FILE` writes what a run needs to be reproduced: every exchange at
+its boundary, in order — an outbound HTTP request and its response, a tool
+call and its result. `nautra replay FILE` runs the workload again and answers
+each exchange from the record; no model is called and no tool is started. A
+workload that asks for something other than what the record has next has left
+its record, and the run ends with exit code 3. `nautra run --resume FILE`
+replays what a stopped run had done and continues for real.
+
+Three decisions shape it:
+
+- **An exchange is two lines**, what was asked before it is carried out and
+  what came back after. A run that died in between is known to have, and
+  that exchange is never repeated: it may have taken effect.
+- **What was asked is the method, the URL and a digest of the body.** Headers
+  are not part of it, so no secret enters a record, and a replay needs none.
+- **A record is tied to the binary** by its digest, and names the `run` line
+  it was made with, so `replay` and `--resume` take only the file.
+
+It is not specific to agents; any component that ends can be recorded. The
+clock and randomness are not recorded yet, so a workload whose requests
+depend on them leaves its record. A response is read whole before the
+workload sees it, so streaming is lost under `--record`.
 
 ## 6. Verbs do not multiply
 
@@ -117,7 +135,7 @@ written for them is ported by making it speak MCP over HTTP.
 
 1. Secrets and the network record. *(done)*
 2. Tools as images, the composition file, and a sample agent in Almide. *(done)*
-3. `--record`, `replay`, resume.
+3. `--record`, `replay`, resume. *(done, without clock and randomness)*
 4. Checks, delegation, remote MCP.
 5. `exec`.
 

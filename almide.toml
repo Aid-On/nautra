@@ -30,6 +30,8 @@ http = "1"
 tokio = { version = "1", features = ["net", "signal", "time", "rt", "macros"] }
 wasmparser = "0.258.3"
 serde_json = "1"
+sha2 = "0.10"
+base64 = "0.22"
 jsonschema = { version = "=0.56.0", default-features = false }
 toml = "0.8"
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
