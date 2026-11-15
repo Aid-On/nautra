@@ -133,6 +133,55 @@ def service_checks(n, wasm):
         expect("a service says where it listens", f"serving on http://127.0.0.1:{port}" in server.stderr.read())
 
 
+def background_checks(n, wasm):
+    """run -d, ps, logs, stop and rm: a run that outlives the command that started it."""
+    port = free_port()
+    started = n("run", "-d", "--name", "web", "-p", port, wasm("web"))
+    check("run -d prints an id", started, 0)
+    run_id = started[1].strip()
+    expect("the id is twelve hex digits", len(run_id) == 12 and all(c in "0123456789abcdef" for c in run_id), repr(run_id))
+    for _ in range(50):
+        if fetch(f"http://127.0.0.1:{port}/")[0]:
+            break
+        time.sleep(0.1)
+    expect("a background service answers", "GET /bg" in fetch(f"http://127.0.0.1:{port}/bg")[1])
+    check("ps lists a running run", n("ps"), 0, out="running")
+    check("ps shows where it is published", n("ps"), 0, out=f"127.0.0.1:{port}")
+    check("logs shows what it wrote", n("logs", "web"), 0, out=f"serving on http://127.0.0.1:{port}")
+    check("a name is used once", n("run", "-d", "--name", "web", "-p", free_port(), wasm("web")), 125, err="already exists")
+    check("a run that fails at once says so", n("run", "-d", "--name", "clash", "-p", port, wasm("web")), 125, err="ended at once")
+    check("a running run is not removed", n("rm", "web"), 125, err="is running")
+    check("a run is found by the start of its id", n("stop", run_id[:6]), 0, out="web")
+    expect("a stopped service no longer answers", fetch(f"http://127.0.0.1:{port}/")[0] == 0)
+    check("ps hides what has ended", n("ps"), 0, absent="web")
+    check("ps -a shows how it ended", n("ps", "-a"), 0, out="exited (0)")
+    check("stop of an ended run fails", n("stop", "web"), 1, err="is not running")
+
+    check("a background command runs to its end", n("run", "-d", "--name", "hi", wasm("hello"), "tide"), 0)
+    for _ in range(50):
+        if "exited" in n("ps", "-a")[1].split("hi")[-1].splitlines()[0]:
+            break
+        time.sleep(0.1)
+    check("its output is kept", n("logs", "hi"), 0, out="hello, tide")
+    check("logs -f ends when the run has ended", n("logs", "-f", "hi"), 0, out="hello, tide")
+
+    check("a looping run starts", n("run", "-d", "--name", "loop", wasm("spin")), 0)
+    check("it is running", n("ps"), 0, out="loop")
+    check("rm -f stops and forgets it", n("rm", "-f", "loop"), 0, out="loop")
+    check("rm forgets ended runs", n("rm", "web", "hi", "clash"), 0, out="clash")
+    check("nothing is left", n("ps", "-a"), 0, absent="exited")
+    expect("no run directory is left", not any((n.home / "runs").iterdir()))
+
+    check("--rm leaves no record", n("run", "-d", "--rm", "--name", "brief", wasm("hello")), 0)
+    for _ in range(50):
+        if not any((n.home / "runs").iterdir()):
+            break
+        time.sleep(0.1)
+    expect("the --rm run is forgotten when it ends", not any((n.home / "runs").iterdir()))
+    check("-d has no terminal for -i", n("run", "-d", "-i", wasm("hello")), 125, err="without a terminal")
+    check("an unknown run is refused", n("logs", "absent"), 125, err="no run named")
+
+
 def run_checks(n, work):
     wasm = lambda name: WASM / f"{name}.wasm"
 
@@ -193,6 +242,7 @@ def run_checks(n, work):
     check("-p needs a service", n("run", "-p", free_port(), wasm("hello")), 125, err="no HTTP handler")
     check("-p takes one port, not a mapping", n("run", "-p", "8080:80", wasm("web")), 125, err="no port of its own")
     service_checks(n, wasm)
+    background_checks(n, wasm)
 
     # Images: build, name, inspect, remove.
     (work / "files.wasm").write_bytes(wasm("files").read_bytes())

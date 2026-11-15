@@ -8,6 +8,11 @@ fn usage() -> String = """
   Usage: nautra <command> [options]
 
     run [grants] IMAGE|FILE.wasm [args…]   run a workload with exactly what you grant it
+    run -d [--name NAME] …                  the same, in the background; prints the run's id
+    ps [-a]                                 list background runs (-a: ended ones too)
+    logs [-f] RUN                           what a background run has written (-f: keep following)
+    stop [-t DURATION] RUN…                 ask a background run to end, then end it
+    rm [-f] RUN…                            forget a background run and its log
     build [-t NAME] [-f Nautrafile] [PATH]  package a .wasm file as an image
     images                                  list stored images
     inspect IMAGE|FILE.wasm                 what an image is, what it asks for, what it can reach
@@ -30,6 +35,7 @@ fn usage() -> String = """
         --fuel N                   a ceiling on executed instructions
 
   Grants come before the image; everything after it is the workload's own.
+  A RUN is a background run's name, its id, or the start of its id.
 
   An image is named [REGISTRY/]NAME[:TAG][@DIGEST]. A name with no registry is
   local. Images live in $NAUTRA_HOME (default ~/.nautra). Registry logins are

@@ -1,0 +1,156 @@
+// SPDX-License-Identifier: Apache-2.0
+// Background runs. There is no daemon: `run -d` starts nautra once more
+// with no terminal, and what is known about that process is a directory.
+//
+//   <home>/runs/<id>/run.json   what was started, and as which process
+//   <home>/runs/<id>/log        its stdout and stderr
+//   <home>/runs/<id>/exit       its exit code, written when it ends by itself
+//
+// A process id is only a number the system hands out again, so a run is
+// identified by its pid together with the moment that process was born.
+
+import env
+import fs
+import json
+import path
+import process
+import random
+import hex
+import self.store
+
+type Run: Codec = {
+  id: String,
+  name: String,
+  image: String,
+  pid: Int,
+  born: String,
+  started: String,
+  publish: String,
+  args: List[String],
+}
+
+effect fn root() -> String = path.join(store.home()!, "runs")
+
+effect fn dir(id: String) -> String = path.join(root()!, id)
+
+effect fn log_path(id: String) -> String = path.join(dir(id)!, "log")
+
+effect fn new_id() -> String = hex.encode(random.bytes(6))
+
+// When the process with this id was started, as `ps` prints it; none when
+// there is no such process.
+effect fn born(pid: Int) -> String? = match process.output(process.ProcessCommand { cmd: "ps", args: ["-o", "lstart=", "-p", int.to_string(pid)] }) {
+  ok(st) => if st.code == 0 and string.trim(st.stdout) != "" then some(string.trim(st.stdout)) else none,
+  err(_) => none,
+}
+
+effect fn save(r: Run) -> Unit = {
+  fs.mkdir_p(dir(r.id)!)!
+  fs.write_text(path.join(dir(r.id)!, "run.json"), json.stringify_pretty(Run.encode(r)) + "\n")!
+}
+
+effect fn load(id: String) -> Run = {
+  let text = fs.read_text(path.join(dir(id)!, "run.json"))!
+  Run.decode(json.parse(text)!)!
+}
+
+// Every recorded run, oldest first. A directory without a readable record
+// (a run that is still being set up) is passed over.
+effect fn all() -> List[Run] = {
+  let base = root()!
+  let ids = if fs.is_dir(base) then fs.list_dir(base)! else []
+  ids |> list.filter_map((id) => load(id)?) |> list.sort_by((r) => r.started + r.id)
+}
+
+// Still the process that was started, not another that got its pid since.
+effect fn alive(r: Run) -> Bool = born(r.pid)! == some(r.born)
+
+effect fn exit_code(id: String) -> Int? =
+  (fs.read_text_if_exists(path.join(dir(id)!, "exit"))! |> option.flat_map((text) => int.parse(string.trim(text))?))
+
+// Called by the background process itself, as it ends.
+effect fn record_exit(id: String, code: Int) -> Unit = fs.write_text(path.join(dir(id)!, "exit"), "${code}\n")!
+
+// `running`, `exited (N)` when it ended by itself, or `stopped` when it was
+// ended from outside before it could say how.
+effect fn status(r: Run) -> String = match exit_code(r.id)! {
+  some(code) => "exited (${code})",
+  none => if alive(r)! then "running" else "stopped",
+}
+
+// A run by its name, its id, or the start of its id when that is enough to
+// tell it apart.
+effect fn find(text: String) -> Run = {
+  let known = all()!
+  let exact = known |> list.find((r) => r.name == text or r.id == text)
+  match exact {
+    some(r) => r,
+    none => match known |> list.filter((r) => string.starts_with(r.id, text)) {
+      [only] => only,
+      [] => err("no run named '${text}'; see `nautra ps -a`")!,
+      _ => err("'${text}' is the start of more than one run id")!,
+    },
+  }
+}
+
+effect fn is_name_taken(name: String) -> Bool = all()! |> list.any((r) => r.name == name)
+
+// Asks a run to end, waits up to `grace_ms`, then ends it. Returns false
+// when it was not running.
+effect fn stop(r: Run, grace_ms: Int) -> Bool = {
+  if not alive(r)! then false else {
+    let _ = process.kill(r.pid, 15)
+    var waited = 0
+    while waited < grace_ms and alive(r)! {
+      env.sleep_ms(100)
+      waited = waited + 100
+    }
+    if alive(r)! then {
+      let _ = process.kill(r.pid, 9)
+    }
+    true
+  }
+}
+
+effect fn remove(r: Run) -> Unit = fs.remove_all(dir(r.id)!)!
+
+// Called by a background process: waits until the process that started it
+// has written the record, so that ending early cannot race the write.
+effect fn await_record(id: String) -> Unit = {
+  // Named outside the loop: a call on `id` inside a `while` condition does
+  // not build with Almide 0.70.0-rc1 (almide/almide#4752).
+  let record = path.join(dir(id)!, "run.json")
+  var waited = 0
+  while waited < 2000 and not fs.exists(record) {
+    env.sleep_ms(20)
+    waited = waited + 20
+  }
+}
+
+// The options of a `run` line as its background process should get them:
+// without the ones that ask for the background.
+fn child_options(options: List[String]) -> List[String] = {
+  var kept: List[String] = []
+  var skip = false
+  for option in options {
+    if skip then {
+      skip = false
+    } else if option == "--name" then {
+      skip = true
+    } else if option != "-d" and option != "--detach" and not string.starts_with(option, "--name=") then {
+      kept = kept + [option]
+    }
+  }
+  kept
+}
+
+test "the background process is started without the background options" {
+  assert_eq(child_options(["-d", "--name", "web", "-p", "8080"]), ["-p", "8080"])
+  assert_eq(child_options(["--detach", "--name=web", "--rm", "-e", "A=1"]), ["--rm", "-e", "A=1"])
+  assert_eq(child_options([]), [])
+}
+
+test "a run record roundtrips" {
+  let r = Run { id: "0123456789ab", name: "web", image: "web:v1", pid: 42, born: "Sun Nov 15 12:00:00 2026", started: "2026-11-15T03:00:00Z", publish: "127.0.0.1:8080", args: ["a"] }
+  assert_eq(Run.decode(Run.encode(r)), ok(r))
+}

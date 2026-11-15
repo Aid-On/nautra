@@ -3,6 +3,7 @@
 
 import env
 import fs
+import io
 import json
 import path
 import process
@@ -13,6 +14,7 @@ import self.image
 import self.oci
 import self.reference
 import self.registry
+import self.runs
 import self.store
 
 // A workload ready to run: the binary on disk, the name it sees itself run
@@ -96,8 +98,9 @@ local effect fn environment(config: image.Config, wanted: List[grants.EnvGrant])
   pairs
 }
 
-local effect fn cmd_run(args: List[String]) -> Int = {
-  let line = grants.parse_run(args)!
+// One run on this process, to its end: what `run` does, and what the
+// process behind a background run does.
+local effect fn run_here(line: grants.RunLine) -> Int = {
   for mount in line.grants.mounts {
     guard fs.is_dir(mount.host) else err("cannot mount '${mount.host}': it is not a directory")!
   }
@@ -117,6 +120,139 @@ local effect fn cmd_run(args: List[String]) -> Int = {
     eprintln("nautra: ${outcome.error}")
   }
   outcome.exit_code
+}
+
+// Starts a run in the background and prints its id. Everything that can be
+// refused is refused here, in front of the person asking; the background
+// process then does the same run again with no terminal.
+local effect fn start_detached(args: List[String], line: grants.RunLine) -> Int = {
+  for mount in line.grants.mounts {
+    guard fs.is_dir(mount.host) else err("cannot mount '${mount.host}': it is not a directory")!
+  }
+  let target = locate(line.image)!
+  let id = runs.new_id()!
+  let derived = "${string.strip_suffix(target.name, ".wasm") ?? target.name}-${string.take(id, 6)}"
+  let name = if line.name != "" then line.name else if grants.is_run_name(derived) then derived else id
+  guard not runs.is_name_taken(name)! else err("a run named '${name}' already exists: remove it with `nautra rm ${name}`, or pick another --name")!
+  fs.mkdir_p(runs.dir(id)!)!
+  let options = list.take(args, list.len(args) - list.len(line.args) - 1)
+  let pid = engine.spawn_self(["run", "--run-id", id] + runs.child_options(options) + [line.image] + line.args, runs.log_path(id)!)!
+  runs.save(runs.Run {
+    id: id,
+    name: name,
+    image: line.image,
+    pid: pid,
+    born: runs.born(pid)! ?? "",
+    started: datetime.to_iso(datetime.now()),
+    publish: line.grants.publish,
+    args: line.args,
+  })!
+  // A run that fails at once (a port already taken, say) is reported now
+  // rather than left to be found in `ps`.
+  env.sleep_ms(300)
+  match runs.exit_code(id)! {
+    some(code) if code != 0 => {
+      eprintln(string.trim_end(fs.read_text(runs.log_path(id)!) ?? ""))
+      eprintln("nautra: ${name} ended at once with exit code ${code}")
+      code
+    },
+    _ => {
+      println(id)
+      0
+    },
+  }
+}
+
+local effect fn cmd_run(args: List[String]) -> Int = {
+  let line = grants.parse_run(args)!
+  if line.detach then start_detached(args, line)!
+  else if line.run_id == "" then run_here(line)!
+  else {
+    // This process is a background run: it reports to its record.
+    runs.await_record(line.run_id)!
+    let code = match run_here(line) {
+      ok(c) => c,
+      err(message) => {
+        eprintln("nautra: ${message}")
+        125
+      },
+    }
+    if line.remove then fs.remove_all(runs.dir(line.run_id)!)! else runs.record_exit(line.run_id, code)!
+    code
+  }
+}
+
+local effect fn cmd_ps(args: List[String]) -> Int = {
+  let everything = list.contains(args, "-a") or list.contains(args, "--all")
+  guard list.all(args, (a) => a == "-a" or a == "--all") else err("ps takes only -a")!
+  var rows = [["ID", "NAME", "IMAGE", "STATUS", "PORT", "STARTED"]]
+  for r in runs.all()! {
+    let state = runs.status(r)!
+    if everything or state == "running" then {
+      rows = rows + [[r.id, r.name, image.printable(r.image), state, if r.publish == "" then "-" else r.publish, r.started]]
+    }
+  }
+  println(table(rows))
+  0
+}
+
+// Prints what a run has written so far; with -f, keeps printing until it ends.
+local effect fn cmd_logs(args: List[String]) -> Int = {
+  let follow = list.contains(args, "-f") or list.contains(args, "--follow")
+  let names = args |> list.filter((a) => not string.starts_with(a, "-"))
+  guard list.len(names) == 1 and list.len(args) <= 2 else err("logs takes one run: nautra logs [-f] NAME")!
+  let r = runs.find(list.get(names, 0) ?? "")!
+  let file = runs.log_path(r.id)!
+  var seen = 0
+  var running = true
+  while running {
+    // Whether it is running is read before the log, so that the last lines
+    // written just before it ended are not missed.
+    running = follow and runs.alive(r)!
+    let data = fs.read_bytes(file) ?? bytes.new()
+    if bytes.len(data) > seen then {
+      io.write(io.stdout()!, bytes.drop(data, seen))!
+      seen = bytes.len(data)
+    }
+    if running then {
+      env.sleep_ms(200)
+    }
+  }
+  0
+}
+
+local effect fn cmd_stop(args: List[String]) -> Int = {
+  let (grace_ms, names) = match args {
+    ["-t", seconds, ..rest] => (grants.parse_duration(seconds)!, rest),
+    _ => (10000, args),
+  }
+  guard not list.is_empty(names) else err("stop needs at least one run")!
+  var idle = 0
+  for text in names {
+    let r = runs.find(text)!
+    if runs.stop(r, grace_ms)! then println(r.name) else {
+      eprintln("nautra: ${r.name} is not running")
+      idle = idle + 1
+    }
+  }
+  if idle == 0 then 0 else 1
+}
+
+// Forgets runs that have ended; -f stops one that has not.
+local effect fn cmd_rm(args: List[String]) -> Int = {
+  let force = list.contains(args, "-f") or list.contains(args, "--force")
+  let names = args |> list.filter((a) => a != "-f" and a != "--force")
+  guard not list.is_empty(names) else err("rm needs at least one run")!
+  for text in names {
+    let r = runs.find(text)!
+    if runs.alive(r)! then {
+      guard force else err("${r.name} is running: stop it first, or use `nautra rm -f ${r.name}`")!
+      let _ = runs.stop(r, 10000)!
+    }
+    runs.remove(r)!
+    println(r.name)
+  }
+  0
 }
 
 type BuildLine = { tags: List[String], file: String, context: String }
@@ -281,7 +417,11 @@ local effect fn dispatch(args: List[String]) -> Int = {
     "images" | "image" | "ls" => cmd_images()!,
     "inspect" => cmd_inspect(rest)!,
     "tag" => cmd_tag(rest)!,
-    "rmi" | "rm" => cmd_rmi(rest)!,
+    "rmi" => cmd_rmi(rest)!,
+    "ps" => cmd_ps(rest)!,
+    "logs" => cmd_logs(rest)!,
+    "stop" => cmd_stop(rest)!,
+    "rm" => cmd_rm(rest)!,
     "pull" => cmd_pull(rest)!,
     "push" => cmd_push(rest)!,
     "version" | "--version" | "-V" => {

@@ -17,6 +17,7 @@
   <a href="#quick-start">Quick start</a> ·
   <a href="#grants">Grants</a> ·
   <a href="#services">Services</a> ·
+  <a href="#background-runs">Background</a> ·
   <a href="#images">Images</a> ·
   <a href="#registries">Registries</a> ·
   <a href="#project-status">Status</a> ·
@@ -131,6 +132,40 @@ to accept connections from elsewhere. Requests are handled side by side,
 `--timeout` is a deadline per request, and the service is given the same
 grants as any run: nothing by default. It stops on Ctrl-C or SIGTERM.
 
+## Background runs
+
+`-d` starts a run in the background and prints its id. There is no daemon
+behind it: the run is one more nautra process with no terminal, and what
+nautra knows about it is a directory under `~/.nautra/runs`.
+
+```text
+$ nautra run -d --name web -p 8080 target/wasm/web.wasm
+5e834c6e4266
+
+$ nautra ps
+ID            NAME  IMAGE                 STATUS   PORT            STARTED
+5e834c6e4266  web   target/wasm/web.wasm  running  127.0.0.1:8080  2026-11-15T07:27:31Z
+
+$ nautra logs web
+nautra: serving on http://127.0.0.1:8080
+
+$ nautra stop web
+web
+```
+
+| | |
+|---|---|
+| `nautra run -d [--name NAME] [--rm] …` | start in the background; `--rm` forgets the run when it ends |
+| `nautra ps [-a]` | running runs; `-a` adds the ones that ended, with how |
+| `nautra logs [-f] RUN` | what it wrote to stdout and stderr; `-f` follows until it ends |
+| `nautra stop [-t 10s] RUN…` | SIGTERM, then SIGKILL after the wait |
+| `nautra rm [-f] RUN…` | forget an ended run and its log; `-f` stops it first |
+
+A `RUN` is a name, an id, or the start of an id. A run that fails at once —
+a port already taken, a missing mount — is reported by `run -d` itself, with
+its exit code, instead of being left to be found in `ps`. A background run
+ends with the machine; nothing restarts it.
+
 ## Images
 
 An image is a `.wasm` binary plus a description. Describe it in a `Nautrafile`:
@@ -215,7 +250,7 @@ experimental in wasmtime, and services inherit that. Push and pull are tested ag
 
 Not there yet:
 
-- long-running workloads: detached runs, logs, restart policy
+- restart policies and starting runs again after a reboot
 - TLS on a published port, and HTTP/2
 - several workloads together (compose) and networking between them
 - signing, provenance and policy on what may be pulled

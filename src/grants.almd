@@ -25,7 +25,19 @@ type Grants = {
 }
 
 // A parsed `nautra run` line: the grants, the image, and the guest's arguments.
-type RunLine = { grants: Grants, image: String, args: List[String] }
+//
+// `detach` runs it in the background under `name`; `remove` forgets a
+// background run once it ends. `run_id` is set only on the process a
+// background run starts: it says which record that process reports to.
+type RunLine = {
+  grants: Grants,
+  image: String,
+  args: List[String],
+  detach: Bool,
+  name: String,
+  remove: Bool,
+  run_id: String,
+}
 
 fn nothing() -> Grants = Grants {
   mounts: [],
@@ -141,8 +153,17 @@ local fn takes_value(flag: String) -> Bool =
   list.contains(["-v", "--volume", "-e", "--env", "--allow-net", "-p", "--publish", "-m", "--memory", "--timeout", "--fuel"], flag)
 
 // Options come before the image; everything after it belongs to the guest.
+fn is_run_name(text: String) -> Bool =
+  text != ""
+    and string.is_alphanumeric(string.take(text, 1))
+    and string.to_list(text) |> list.all((c) => (string.is_alphanumeric(c) and string.byte_len(c) == 1) or string.contains("_.-", c))
+
 fn parse_run(args: List[String]) -> RunLine! = {
   var grants = nothing()
+  var detach = false
+  var remove = false
+  var name = ""
+  var run_id = ""
   var i = 0
   var image = ""
   while image == "" and i < list.len(args) {
@@ -155,7 +176,18 @@ fn parse_run(args: List[String]) -> RunLine! = {
         some((o, v)) if string.starts_with(arg, "--") => (o, some(v)),
         _ => (arg, none),
       }
-      if takes_value(flag) then {
+      if flag == "--name" or flag == "--run-id" then {
+        let text = match inline {
+          some(v) => v,
+          none => {
+            let next = list.get(args, i) |> option.to_result("${flag} needs a value")!
+            i = i + 1
+            next
+          },
+        }
+        guard is_run_name(text) else err("'${text}' is not a name: use letters, digits, '_', '.' and '-'")
+        if flag == "--name" then { name = text } else { run_id = text }
+      } else if takes_value(flag) then {
         let text = match inline {
           some(v) => v,
           none => {
@@ -168,15 +200,19 @@ fn parse_run(args: List[String]) -> RunLine! = {
       } else {
         match flag {
           "-i" | "--interactive" => { grants = { ...grants, stdin: true } },
-          // A run leaves nothing behind to remove; accepted so the habit works.
-          "--rm" => (),
+          "-d" | "--detach" => { detach = true },
+          // A foreground run leaves nothing behind; a background one leaves
+          // its record and log until removed, unless this is given.
+          "--rm" => { remove = true },
           _ => err("unknown option '${flag}'")!,
         }
       }
     }
   }
   guard image != "" else err("run needs an image or a .wasm file")
-  RunLine { grants: grants, image: image, args: list.drop(args, i) }
+  guard not (detach and grants.stdin) else err("-d runs without a terminal, so -i has nothing to read from")
+  guard name == "" or detach else err("--name names a background run; add -d")
+  RunLine { grants: grants, image: image, args: list.drop(args, i), detach: detach, name: name, remove: remove, run_id: run_id }
 }
 
 test "a workload is given nothing by default" {
@@ -238,4 +274,14 @@ test "a service is published on this machine unless an address is named" {
   assert(result.is_err(parse_publish("http")))
   assert(result.is_err(parse_publish(":8080")))
   assert_eq(parse_run(["-p", "8080", "web"])!.grants.publish, "127.0.0.1:8080")
+}
+
+test "a background run is named, and has no terminal" {
+  let line = parse_run(["-d", "--name", "web-1", "-p", "8080", "web"])!
+  assert(line.detach)
+  assert_eq(line.name, "web-1")
+  assert(result.is_err(parse_run(["-d", "-i", "app"])))
+  assert(result.is_err(parse_run(["--name", "x", "app"])))
+  assert(result.is_err(parse_run(["-d", "--name", "../x", "app"])))
+  assert(not parse_run(["app"])!.detach)
 }

@@ -9,6 +9,10 @@ repository = "https://github.com/Aid-On/nautra"
 # Native code can do anything, so calling the engine needs every capability.
 [permissions]
 allow = ["FS.read", "FS.write", "IO", "Env", "Time", "Net", "Proc", "Rand", "Fan", "Abort"]
+# What nautra may do to other processes: ask `ps` when one was born (to tell
+# a background run from another process that later got its pid), and signal
+# a background run to stop it.
+proc = ["ps", "kill"]
 
 # The only native code is the engine: wasmtime, and the two parsers it needs
 # (the wasm binary format for `inspect`, TOML for the Nautrafile). ureq is a

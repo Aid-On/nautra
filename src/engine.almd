@@ -12,6 +12,9 @@ fn nt_run(request_json: String) -> String
 @extern(rs, "engine", "nt_serve")
 fn nt_serve(request_json: String) -> String
 
+@extern(rs, "engine", "nt_spawn_self")
+fn nt_spawn_self(request_json: String) -> String
+
 @extern(rs, "engine", "nt_inspect")
 fn nt_inspect(path: String) -> String
 
@@ -100,6 +103,15 @@ effect fn upload(method: String, target: String, headers: List[(String, String)]
     _ => none,
   })
   http.with_headers(status, value.get_string(doc, "body") ?? "", pairs)
+}
+
+// Starts nautra itself again in the background with these arguments, its
+// output appended to `log`. Returns the new process id.
+effect fn spawn_self(args: List[String], log: String) -> Int = {
+  let req = value.object([("args", value.array(args |> list.map(value.string))), ("log", value.string(log))])
+  let doc = json.parse(nt_spawn_self(json.stringify(req)))!
+  guard let pid = value.get_int(doc, "pid") else none => err(value.get_string(doc, "error") ?? "cannot start in the background")!
+  pid
 }
 
 test "a request with no grants opens nothing" {

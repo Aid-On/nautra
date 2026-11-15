@@ -78,9 +78,14 @@ only at the moment of download.
 ## 6. No daemon
 
 `nautra run` is one process that runs one workload and exits with its exit
-code. Long-running and multi-workload operation, when it comes, is built on
-that — supervised by the tool the host already has, or by a nautra supervisor
-that is itself an ordinary process.
+code. `run -d` is that same process started once more with no terminal; what
+is known about it is a directory (`runs/<id>`: what was started, its log, its
+exit code), and `ps`, `logs`, `stop` and `rm` read and act on that directory.
+A run is identified by its process id together with the moment that process
+was born, so a pid the system has handed to something else is never
+signalled. Restarting, and several workloads together, are built on the same
+footing — supervised by the tool the host already has, or by a nautra
+supervisor that is itself an ordinary process.
 
 *Why:* a privileged always-on daemon is the largest part of a container
 engine's attack surface and the reason it needs root. A Wasm workload needs

@@ -17,9 +17,11 @@ proposing a change in direction.
 | `src/store.almd` | the local store, an OCI image layout |
 | `src/image.almd` | Nautrafile, building an image, what an image asks for |
 | `src/registry.almd` | OCI Distribution: pull, push, authentication |
+| `src/runs.almd` | background runs: the record, the log, stop and remove |
 | `src/engine.almd` | every `@extern` into the native side |
 | `native/engine.rs` | one run applied to wasmtime; the guest's view of the host, built from the request |
 | `native/engine/serve.rs` | an HTTP component served on a published address (`-p`) |
+| `native/engine/spawn.rs` | `run -d`: nautra started once more with no terminal |
 | `native/engine/inspect.rs` | what a `.wasm` file is, without compiling it |
 | `native/engine/upload.rs` | stopgap: a byte-exact request body (see ADR-0001 §3) |
 | `examples/` | guest programs in Almide, built to `target/wasm` |
@@ -67,3 +69,5 @@ NAUTRA_TEST_REGISTRY=localhost:5057 python3 scripts/integration.py target/nautra
   a compiler bug in 0.70.0-rc1 (almide/almide#4745); wrap it in a lambda.
 - `http.set_body_bytes` on a request is lossy in 0.70.0-rc1 (the body crosses
   as text, almide/almide#4744); binary uploads use `engine.upload`.
+- A call on a `String` parameter inside a `while` condition does not build in
+  0.70.0-rc1 (almide/almide#4752); hoist it into a `let` before the loop.
