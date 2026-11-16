@@ -102,10 +102,19 @@ there is nothing inside to map to. Listening on every interface by default is
 a known way container ports end up reachable from a network nobody meant, so
 the wider reach is the one that has to be spelled out.
 
-## 8. Open core, split by who needs it
+## 8. One licence, and where a commercial edition would go
 
-Capabilities an individual or a single team needs to build, ship and run Wasm
-workloads are Community Edition (Apache-2.0). Capabilities that exist because
-an organisation operates nautra at scale — organisation-wide policy on what
-may be pulled and granted, audit, identity integration, fleet management —
-belong in `ee/`. Core never depends on `ee/`. See [LICENSING.md](../../LICENSING.md).
+Everything in this repository is Apache-2.0. What an individual or a single
+team needs to build, ship and run Wasm workloads stays here, under that
+licence.
+
+Capabilities that exist because an organisation operates nautra at scale —
+organisation-wide policy on what may be pulled and granted, collecting audit
+records centrally, identity integration, fleet management — are not built.
+If Aid-On offers them commercially, they are added beside the core, which
+never depends on them and never loses a capability to them.
+
+*Revised 2026-11-16:* this section first set aside an `ee/` directory under a
+separate licence, with a contributor agreement. Both were removed before
+anything was in them: they made a project with nothing to sell look harder
+to adopt than it is.

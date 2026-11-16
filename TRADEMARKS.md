@@ -2,7 +2,7 @@
 
 "Nautra", "Nautra Enterprise" and the Nautra logo (the "Marks") are
 trademarks of Aid-On. The code is open; the name is not. The Apache License
-covers the code outside `ee/` and explicitly grants no trademark rights.
+covers the code and explicitly grants no trademark rights.
 
 ## You may, without asking
 

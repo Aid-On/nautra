@@ -9,7 +9,7 @@
 
 <p align="center">
   <a href="https://github.com/Aid-On/nautra/actions/workflows/ci.yml"><img src="https://github.com/Aid-On/nautra/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="./LICENSING.md"><img src="https://img.shields.io/badge/license-Apache--2.0%20%2B%20Enterprise-6447f0.svg" alt="License: Apache-2.0 + Nautra Enterprise"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-6447f0.svg" alt="License: Apache-2.0"></a>
   <img src="https://img.shields.io/badge/status-pre--alpha-c679fc.svg" alt="Status: pre-alpha">
 </p>
 
@@ -23,7 +23,7 @@
   <a href="#registries">Registries</a> ·
   <a href="#project-status">Status</a> ·
   <a href="./docs/adr/">Design</a> ·
-  <a href="./LICENSING.md">Licensing</a>
+  <a href="./LICENSE">Licence</a>
 </p>
 
 <p align="center">
@@ -582,24 +582,16 @@ Not there yet:
 - signing, provenance and policy on what may be pulled
 - credential helpers, a compiled-code cache
 
-## Editions and licence
+## Licence
 
-Nautra is open core:
-
-| | Community Edition | Nautra Enterprise |
-|---|---|---|
-| Source | everything outside [`ee/`](ee/) | adds the contents of [`ee/`](ee/) |
-| Licence | [Apache License 2.0](LICENSE) | [Nautra Enterprise License](ee/LICENSE), with a subscription from Aid-On |
-
-Everything described in this README is Community Edition. The split, and the
-rules that keep it clean, are in [LICENSING.md](LICENSING.md). The name and
-logo are covered by [TRADEMARKS.md](TRADEMARKS.md).
+Nautra is licensed under the [Apache License 2.0](LICENSE). The name and logo
+are covered by [TRADEMARKS.md](TRADEMARKS.md).
 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Contributions are accepted under the
-[Contributor License Agreement](CLA.md). Report vulnerabilities privately, as
-described in [SECURITY.md](SECURITY.md).
+same licence as the project. Report vulnerabilities privately, as described in
+[SECURITY.md](SECURITY.md).
 
 ## The name
 

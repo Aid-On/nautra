@@ -38,7 +38,6 @@ what a scheme is.
 | `native/engine/inspect.rs` | what a `.wasm` file is, without compiling it |
 | `native/engine/upload.rs` | stopgap: a byte-exact request body (see ADR-0001 §3) |
 | `examples/` | guest programs in Almide, built to `target/wasm` |
-| `ee/` | Nautra Enterprise; a different licence. Core never imports it |
 
 ## Build and verify
 
@@ -105,8 +104,7 @@ need glibc 2.39; the image carries its own.
 - Policy stays in Almide. The native side applies a finished request. A
   tool's whole run request is prepared before the workload starts; the
   engine only looks it up by name when the tool is called.
-- Every source file carries the SPDX header of its directory: `Apache-2.0`
-  outside `ee/`, `LicenseRef-Nautra-Enterprise` inside.
+- Every source file carries the header `SPDX-License-Identifier: Apache-2.0`.
 
 ## Almide notes
 

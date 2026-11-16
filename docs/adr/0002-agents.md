@@ -196,4 +196,4 @@ written for them is ported by making it speak MCP over HTTP.
 
 Organisation-wide concerns — collecting records centrally, policy on which
 images may be pulled and which grants and secrets may be given, signing
-records — belong in `ee/` (ADR-0001 §8).
+records — are outside the core (ADR-0001 §8).
