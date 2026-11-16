@@ -1,6 +1,6 @@
 # Trademark policy
 
-"Nautra", "Nautra Enterprise" and the Nautra logo (the "Marks") are
+"Nautra" and the Nautra logo (the "Marks") are
 trademarks of Aid-On. The code is open; the name is not. The Apache License
 covers the code and explicitly grants no trademark rights.
 
@@ -17,8 +17,7 @@ covers the code and explicitly grants no trademark rights.
   package ("Nautra Cloud", "Nautra Pro", `nautra-*` as a hosted offering).
 - Distribute a modified build under the name Nautra. A fork must use a
   different name and may state that it is "based on Nautra".
-- Use the names "Nautra Enterprise" or "Enterprise Edition of Nautra", or
-  otherwise suggest that an offering is the commercial edition, or is
+- Suggest that an offering is the official edition of Nautra, or is
   provided, certified or endorsed by Aid-On.
 - Use the logo other than to link to the official project.
 
