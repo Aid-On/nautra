@@ -9,7 +9,7 @@
 
 <p align="center">
   <a href="https://github.com/Aid-On/nautra/actions/workflows/ci.yml"><img src="https://github.com/Aid-On/nautra/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="./LICENSING.md"><img src="https://img.shields.io/badge/license-Apache--2.0%20%2B%20Enterprise-6447f0.svg" alt="License: Apache-2.0 + Nautra Enterprise"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-6447f0.svg" alt="License: Apache-2.0"></a>
   <img src="https://img.shields.io/badge/status-pre--alpha-c679fc.svg" alt="Status: pre-alpha">
 </p>
 
@@ -23,7 +23,7 @@
   <a href="#レジストリ">レジストリ</a> ·
   <a href="#現状">現状</a> ·
   <a href="./docs/adr/">設計</a> ·
-  <a href="./LICENSING.md">ライセンス</a>
+  <a href="./LICENSE">ライセンス</a>
 </p>
 
 <p align="center">
@@ -442,20 +442,13 @@ OCI Distribution API に対応したレジストリなら、どれでも使え�
 - 署名、来歴の証明、pull してよいものを決めるポリシー
 - 認証情報ヘルパー、コンパイル結果のキャッシュ
 
-## エディションとライセンス
+## ライセンス
 
-Nautra はオープンコアです。
-
-| | Community Edition | Nautra Enterprise |
-|---|---|---|
-| ソース | [`ee/`](ee/) 以外のすべて | [`ee/`](ee/) の内容を加えたもの |
-| ライセンス | [Apache License 2.0](LICENSE) | [Nautra Enterprise License](ee/LICENSE)。Aid-On とのサブスクリプション契約が必要 |
-
-この README に書いた機能は、すべて Community Edition のものです。2つの境界と、それを保つためのルールは [LICENSING.md](LICENSING.md) にあります。名前とロゴの扱いは [TRADEMARKS.md](TRADEMARKS.md) で定めています。
+Nautra のライセンスは [Apache License 2.0](LICENSE) です。名前とロゴの扱いは [TRADEMARKS.md](TRADEMARKS.md) で定めています。
 
 ## コントリビューション
 
-[CONTRIBUTING.md](CONTRIBUTING.md) を見てください。コントリビューションは [Contributor License Agreement](CLA.md) のもとで受け付けます。脆弱性は [SECURITY.md](SECURITY.md) の手順で非公開のまま報告してください。
+[CONTRIBUTING.md](CONTRIBUTING.md) を見てください。コントリビューションはプロジェクトと同じライセンスで受け付けます。脆弱性は [SECURITY.md](SECURITY.md) の手順で非公開のまま報告してください。
 
 ## 名前
 
